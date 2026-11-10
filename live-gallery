@@ -1,0 +1,949 @@
+#!/usr/bin/env python3
+"""live-gallery: watch folders recursively and show new images and 3D models in a
+browser the moment they appear, newest first, no matter how deeply nested.
+
+    live-gallery [DIR ...] [--port 8765] [--initial 150] [-x DIRNAME] [--poll] [--open]
+
+Standard library only. Uses Linux inotify (instant, idle when nothing changes); falls back
+to polling every --interval seconds elsewhere or with --poll. 3D previews load three.js from a CDN inside the browser.
+"""
+import argparse
+import errno
+import json
+import mimetypes
+import os
+import queue
+import select
+import struct
+import sys
+import threading
+import time
+import urllib.parse
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".avif", ".ico"}
+MODEL_EXT = {".glb", ".gltf", ".obj", ".stl", ".ply", ".fbx"}
+# Noise: dependencies, caches, browser/app profiles agents' tooling leaves behind.
+SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".mypy_cache", ".pytest_cache",
+             ".tox", ".cache", "cache", "Cache", "site-packages", "vendor", "target", ".godot",
+             ".import", "tool_profiles", "app_userdata"}
+
+for t, e in [("model/gltf-binary", ".glb"), ("model/gltf+json", ".gltf"), ("image/webp", ".webp"),
+             ("image/avif", ".avif"), ("image/svg+xml", ".svg"), ("model/stl", ".stl")]:
+    mimetypes.add_type(t, e)
+
+
+def kind_of(name):
+    ext = os.path.splitext(name)[1].lower()
+    if ext in IMAGE_EXT:
+        return "image", ext
+    if ext in MODEL_EXT:
+        return "model", ext
+    return None, ext
+
+
+class Inotify:
+    """Minimal Linux inotify via ctypes (no dependencies)."""
+    CLOSE_WRITE, MOVED_FROM, MOVED_TO, CREATE, DELETE = 0x8, 0x40, 0x80, 0x100, 0x200
+    Q_OVERFLOW, IGNORED, ISDIR = 0x4000, 0x8000, 0x40000000
+    MASK = CLOSE_WRITE | MOVED_FROM | MOVED_TO | CREATE | DELETE | 0x01000000 | 0x02000000 | 0x04000000  # ONLYDIR|DONT_FOLLOW|EXCL_UNLINK
+
+    def __init__(self):
+        import ctypes, ctypes.util
+        self.ctypes = ctypes
+        self.libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+        self.fd = self.libc.inotify_init1(0o2000000)  # IN_CLOEXEC
+        if self.fd < 0:
+            raise OSError(ctypes.get_errno(), "inotify_init1 failed")
+
+    def add(self, path):
+        wd = self.libc.inotify_add_watch(self.fd, os.fsencode(path), self.MASK)
+        return wd if wd >= 0 else -self.ctypes.get_errno()
+
+    def rm(self, wd):
+        self.libc.inotify_rm_watch(self.fd, wd)
+
+    def close(self):
+        os.close(self.fd)
+
+    def events(self, stopped):
+        while not stopped():
+            try:
+                if not select.select([self.fd], [], [], 1.0)[0]:
+                    continue
+                buf = os.read(self.fd, 1 << 20)
+            except InterruptedError:
+                continue
+            i = 0
+            while i + 16 <= len(buf):
+                wd, mask, _cookie, n = struct.unpack_from("iIII", buf, i)
+                name = buf[i + 16:i + 16 + n].split(b"\0", 1)[0]
+                i += 16 + n
+                yield wd, mask, os.fsdecode(name)
+
+
+class Watcher:
+    def __init__(self, roots, interval, exclude, poll=False, hub=None):
+        self.roots = roots
+        self.interval = interval
+        self.skip = SKIP_DIRS | set(exclude)
+        self.lock = threading.Lock()
+        self.items = {}    # (root_index, relpath) -> item
+        self.hub = hub     # receives broadcast(event)
+        self.stopped = False
+        self.pending = {}  # polling mode: key -> (size, mtime) seen once, emitted when stable
+        self.wds = {}      # inotify mode: wd -> (root_index, dir path)
+        self.warned = False
+        self.ino = None
+        if not poll:
+            try:
+                self.ino = Inotify()
+            except (OSError, AttributeError) as ex:
+                if sys.platform.startswith("linux"):
+                    print(f"inotify unavailable ({ex}); polling every {interval}s", file=sys.stderr)
+
+    # ---- scanning ----
+    def walk(self, ri, top):
+        found, root, stack = {}, self.roots[ri], [top]
+        while stack and not self.stopped:
+            d = stack.pop()
+            if self.ino:
+                self.watch(ri, d)  # watch before listing, so nothing slips between
+            try:
+                it = os.scandir(d)
+            except OSError:
+                continue
+            with it:
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            if e.name not in self.skip:
+                                stack.append(e.path)
+                            continue
+                        kind, ext = kind_of(e.name)
+                        if not kind:
+                            continue
+                        st = e.stat()
+                    except OSError:
+                        continue
+                    found[(ri, os.path.relpath(e.path, root).replace(os.sep, "/"))] = (st.st_size, st.st_mtime, kind, ext)
+        return found
+
+    def scan_all(self):
+        found = {}
+        for ri, root in enumerate(self.roots):
+            found.update(self.walk(ri, root))
+        return found
+
+    def watch(self, ri, path):
+        wd = self.ino.add(path)
+        if wd >= 0:
+            self.wds[wd] = (ri, path)
+        elif wd == -errno.ENOSPC and not self.warned:
+            self.warned = True
+            print("WARNING: out of inotify watches; some folders are not watched. Narrow the folders, "
+                  "add -x excludes, or raise fs.inotify.max_user_watches.", file=sys.stderr, flush=True)
+
+    # ---- state changes ----
+    def make_item(self, key, info):
+        ri, rel = key
+        size, mtime, kind, ext = info
+        d, _, name = rel.rpartition("/")
+        full = os.path.join(self.roots[ri], *rel.split("/"))
+        return {"id": f"{ri}/{rel}", "rel": rel, "dir": d, "name": name, "kind": kind,
+                "ext": ext[1:], "size": size, "mtime": mtime,
+                "abs": full, "absdir": os.path.dirname(full),
+                "url": f"/f/{ri}/" + urllib.parse.quote(rel)}
+
+    def broadcast(self, ev):
+        if not self.stopped and self.hub:
+            self.hub.broadcast(ev)
+
+    def stop(self):
+        self.stopped = True  # loops notice within a second; the inotify fd is closed by its loop
+
+    def upsert(self, key, info):
+        now = time.time()
+        with self.lock:
+            old = self.items.get(key)
+            if old and (old["size"], old["mtime"]) == info[:2]:
+                return
+            item = self.make_item(key, info)
+            item["first"] = old["first"] if old else now
+            self.items[key] = item
+        # a file still settling within 5s of first appearing stays "new"
+        ev = "update" if old and now - item["first"] > 5 else "add"
+        self.broadcast({"type": ev, "item": item})
+        print(f"[{time.strftime('%H:%M:%S')}] {ev:<6} {item['abs']}", flush=True)
+
+    def remove(self, key):
+        with self.lock:
+            item = self.items.pop(key, None)
+        if item:
+            self.broadcast({"type": "remove", "id": item["id"]})
+
+    def sync(self, cur):
+        for k, v in cur.items():
+            self.upsert(k, v)
+        with self.lock:
+            gone = [k for k in self.items if k not in cur]
+        for k in gone:
+            self.remove(k)
+
+    # ---- run ----
+    def start(self):
+        found = self.scan_all()
+        with self.lock:
+            for k, v in found.items():
+                item = self.make_item(k, v)
+                item["first"] = 0
+                self.items[k] = item
+        loop = self.inotify_loop if self.ino else self.poll_loop
+        threading.Thread(target=loop, daemon=True).start()
+
+    def mode(self):
+        return f"inotify, {len(self.wds)} folders" if self.ino else f"polling every {self.interval}s"
+
+    def inotify_loop(self):
+        try:
+            self._inotify_loop()
+        finally:
+            self.ino.close()
+
+    def _inotify_loop(self):
+        I = Inotify
+        for wd, mask, name in self.ino.events(lambda: self.stopped):
+            try:
+                if mask & I.Q_OVERFLOW:
+                    print("event queue overflowed; rescanning", file=sys.stderr, flush=True)
+                    self.sync(self.scan_all())
+                    continue
+                if mask & I.IGNORED:
+                    self.wds.pop(wd, None)
+                    continue
+                where = self.wds.get(wd)
+                if not where or not name:
+                    continue
+                ri, d = where
+                path = os.path.join(d, name)
+                if mask & I.ISDIR:
+                    if name in self.skip:
+                        continue
+                    if mask & (I.CREATE | I.MOVED_TO):
+                        for k, v in self.walk(ri, path).items():
+                            self.upsert(k, v)
+                    elif mask & I.MOVED_FROM:
+                        self.drop_tree(path)
+                    continue
+                kind, ext = kind_of(name)
+                if not kind:
+                    continue
+                key = (ri, os.path.relpath(path, self.roots[ri]).replace(os.sep, "/"))
+                if mask & (I.CLOSE_WRITE | I.MOVED_TO):
+                    try:
+                        st = os.stat(path)
+                    except OSError:
+                        continue
+                    self.upsert(key, (st.st_size, st.st_mtime, kind, ext))
+                elif mask & (I.DELETE | I.MOVED_FROM):
+                    self.remove(key)
+            except Exception as ex:  # keep watching no matter what
+                print("event error:", ex, file=sys.stderr, flush=True)
+
+    def drop_tree(self, path):
+        prefix = path + os.sep
+        for wd, (_, p) in list(self.wds.items()):
+            if p == path or p.startswith(prefix):
+                self.ino.rm(wd)
+                self.wds.pop(wd, None)
+        with self.lock:
+            gone = [k for k, it in self.items.items() if it["abs"].startswith(prefix)]
+        for k in gone:
+            self.remove(k)
+
+    def poll_loop(self):
+        while not self.stopped:
+            time.sleep(self.interval)
+            if self.stopped:
+                break
+            try:
+                self.poll_tick()
+            except Exception as ex:
+                print("scan error:", ex, file=sys.stderr, flush=True)
+
+    def poll_tick(self):
+        cur = self.scan_all()
+        for k, v in cur.items():
+            with self.lock:
+                old = self.items.get(k)
+            sig = v[:2]
+            if old and (old["size"], old["mtime"]) == sig:
+                self.pending.pop(k, None)
+            elif self.pending.get(k) != sig:  # still being written; wait one more scan
+                self.pending[k] = sig
+            else:
+                del self.pending[k]
+                self.upsert(k, v)
+        with self.lock:
+            gone = [k for k in self.items if k not in cur]
+        for k in gone:
+            self.remove(k)
+        for k in [k for k in self.pending if k not in cur]:
+            del self.pending[k]
+
+
+STATE_PATH = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                          "live-gallery", "state.json")
+
+
+def norm_roots(paths):
+    roots, bad = [], []
+    for p in paths:
+        p = p.strip()
+        if not p:
+            continue
+        r = os.path.abspath(os.path.expanduser(p))
+        if not os.path.isdir(r):
+            bad.append(p)
+        elif r not in roots:
+            roots.append(r)
+    return roots, bad
+
+
+def complete_dirs(prefix, limit=40):
+    p = os.path.expanduser(prefix.strip())
+    if not os.path.isabs(p):
+        return []
+    base, part = (p, "") if p.endswith(("/", os.sep)) else os.path.split(p)
+    try:
+        with os.scandir(base) as it:
+            entries = sorted(it, key=lambda e: e.name.lower())
+    except OSError:
+        return []
+    out, low = [], part.lower()
+    for e in entries:
+        if not e.name.lower().startswith(low) or (e.name.startswith(".") and not part.startswith(".")):
+            continue
+        try:
+            if e.is_dir():
+                out.append(os.path.join(base, e.name) + os.sep)
+        except OSError:
+            continue
+        if len(out) >= limit:
+            break
+    return out
+
+
+class App:
+    """Owns the current Watcher and the browser connections, so the watched folder can change live."""
+
+    def __init__(self, interval, exclude, poll, initial):
+        self.opts = (interval, exclude, poll)
+        self.initial = initial
+        self.lock = threading.Lock()
+        self.clients = []
+        self.w = None
+        self.indexing = False
+        self.gen = 0
+        try:
+            with open(STATE_PATH) as f:
+                self.state = json.load(f)
+            assert isinstance(self.state, dict)
+        except (OSError, ValueError, AssertionError):
+            self.state = {}
+
+    def save_state(self):
+        try:
+            os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+            with open(STATE_PATH + ".tmp", "w") as f:
+                json.dump(self.state, f, indent=2)
+            os.replace(STATE_PATH + ".tmp", STATE_PATH)
+        except OSError as ex:
+            print("could not save state:", ex, file=sys.stderr)
+
+    def broadcast(self, ev):
+        msg = json.dumps(ev)
+        with self.lock:
+            for q in self.clients:
+                q.put(msg)
+
+    def set_roots(self, roots, save=True):
+        interval, exclude, poll = self.opts
+        w = Watcher(roots, interval, exclude, poll, hub=self)
+        with self.lock:
+            old, self.w, self.indexing = self.w, w, True
+            self.gen += 1
+            gen = self.gen
+        if old:
+            old.stop()
+        if save:
+            recent = [r for r in self.state.get("recent", []) if r != roots]
+            self.state.update(roots=roots, recent=[roots] + recent[:11])
+            self.save_state()
+        self.broadcast({"type": "reset"})
+        print(f"indexing {', '.join(roots)} ...", flush=True)
+
+        def run():
+            t = time.time()
+            w.start()
+            with self.lock:
+                current = gen == self.gen
+                if current:
+                    self.indexing = False
+            if current:
+                print(f"watching {', '.join(roots)}: {len(w.items)} images/models, "
+                      f"indexed in {time.time() - t:.1f}s ({w.mode()})", flush=True)
+                self.broadcast({"type": "reset"})
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def listing(self):
+        with self.lock:
+            w, indexing = self.w, self.indexing
+        with w.lock:
+            items = sorted(w.items.values(), key=lambda i: i["mtime"], reverse=True)[:self.initial]
+            total = len(w.items)
+        return {"roots": w.roots, "total": total, "items": items, "indexing": indexing,
+                "mode": w.mode(), "recent": self.state.get("recent", [])}
+
+
+def make_handler(app):
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            u = urllib.parse.urlsplit(self.path)
+            path = u.path
+            if path == "/":
+                return self.send_bytes(PAGE.encode(), "text/html; charset=utf-8")
+            if path == "/api/list":
+                return self.send_json(app.listing())
+            if path == "/api/dirs":
+                prefix = urllib.parse.parse_qs(u.query).get("prefix", [""])[0]
+                return self.send_json({"dirs": complete_dirs(prefix)})
+            if path == "/events":
+                return self.events()
+            if path.startswith("/f/"):
+                return self.file(path[3:])
+            self.send_error(404)
+
+        def do_POST(self):
+            if urllib.parse.urlsplit(self.path).path != "/api/watch":
+                return self.send_error(404)
+            # JSON-only, so other websites can't trigger this with a plain form post
+            if not self.headers.get("Content-Type", "").startswith("application/json"):
+                return self.send_json({"error": "expected JSON"}, 415)
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                paths = json.loads(self.rfile.read(n) or b"{}").get("roots")
+                if isinstance(paths, str):
+                    paths = [paths]
+                if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+                    raise ValueError
+            except (ValueError, AttributeError):
+                return self.send_json({"error": "bad request"}, 400)
+            roots, bad = norm_roots(paths)
+            if bad:
+                return self.send_json({"error": "not a folder: " + ", ".join(bad)}, 400)
+            if not roots:
+                return self.send_json({"error": "enter a folder path"}, 400)
+            app.set_roots(roots)
+            return self.send_json({"ok": True, "roots": roots})
+
+        def send_json(self, obj, status=200):
+            return self.send_bytes(json.dumps(obj).encode(), "application/json", status)
+
+        def send_bytes(self, body, ctype, status=200):
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def file(self, rest):
+            w = app.w
+            ri, _, rel = rest.partition("/")
+            try:
+                ri = int(ri)
+                root = w.roots[ri]
+            except (ValueError, IndexError):
+                return self.send_error(404)
+            rel = urllib.parse.unquote(rel)
+            full = os.path.realpath(os.path.join(root, rel))
+            rroot = os.path.realpath(root)
+            try:  # normcase: Windows paths are case-insensitive; different drives raise ValueError
+                inside = os.path.normcase(os.path.commonpath([full, rroot])) == os.path.normcase(rroot)
+            except ValueError:
+                inside = False
+            with w.lock:
+                listed = (ri, os.path.normpath(rel).replace(os.sep, "/")) in w.items
+            if not (inside or listed) or not os.path.isfile(full):
+                return self.send_error(404)
+            try:
+                f = open(full, "rb")
+            except OSError:
+                return self.send_error(404)
+            with f:
+                self.send_response(200)
+                self.send_header("Content-Type", mimetypes.guess_type(full)[0] or "application/octet-stream")
+                self.send_header("Content-Length", str(os.fstat(f.fileno()).st_size))
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                try:
+                    while chunk := f.read(1 << 20):
+                        self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        def events(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            q = queue.Queue()
+            with app.lock:
+                app.clients.append(q)
+            try:
+                self.wfile.write(b": hi\n\n")
+                self.wfile.flush()
+                while True:
+                    try:
+                        self.wfile.write(f"data: {q.get(timeout=15)}\n\n".encode())
+                    except queue.Empty:
+                        self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            finally:
+                with app.lock:
+                    app.clients.remove(q)
+
+    return H
+
+
+PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Live Gallery</title>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
+<style>
+:root{--bg:#0f1115;--panel:#171a21;--card:#1c2029;--line:#2a2f3a;--text:#e6e8ec;--muted:#8b93a3;--accent:#6aa9ff;--new:#4ade80;--upd:#fbbf24;--c1:#242833;--c2:#1c2029;color-scheme:dark}
+@media (prefers-color-scheme:light){:root{--bg:#f3f4f7;--panel:#fff;--card:#fff;--line:#e2e5ea;--text:#1b1f27;--muted:#667085;--accent:#2563eb;--new:#16a34a;--upd:#d97706;--c1:#eceef2;--c2:#fff;color-scheme:light}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 system-ui,sans-serif}
+header{position:sticky;top:0;z-index:5;display:flex;flex-wrap:wrap;gap:8px 10px;align-items:center;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
+h1{font-size:15px;margin:0;display:flex;align-items:center;gap:8px;white-space:nowrap}
+.dot{width:9px;height:9px;border-radius:50%;background:#ef4444}.dot.live{background:var(--new)}
+#wf{display:flex;gap:6px;flex:1 1 340px;min-width:0}
+#watch{flex:1;min-width:0;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:5px 10px;font:12px ui-monospace,monospace}
+#watch:focus,input[type=search]:focus{outline:2px solid var(--accent);outline-offset:-1px}
+#status{color:var(--muted);font-size:12px;white-space:nowrap}#status.err{color:#ef4444}
+button,input{font:inherit;color:var(--text)}
+button{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:5px 10px;cursor:pointer}
+button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.seg{display:flex}.seg button{border-radius:0;margin-left:-1px}.seg button:first-child{border-radius:8px 0 0 8px}.seg button:last-child{border-radius:0 8px 8px 0}
+input[type=search]{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:5px 10px;width:210px;max-width:100%}
+#count{color:var(--muted);font-size:12px;white-space:nowrap}
+#grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--size,200px),1fr));gap:12px;padding:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden;cursor:pointer;position:relative;transition:box-shadow .6s,border-color .6s}
+.card.fresh{border-color:var(--new);box-shadow:0 0 0 2px var(--new)}.card.fresh.upd{border-color:var(--upd);box-shadow:0 0 0 2px var(--upd)}
+.thumb{aspect-ratio:1;display:grid;place-items:center;background:repeating-conic-gradient(var(--c1) 0 25%,var(--c2) 0 50%) 0 0/16px 16px;overflow:hidden}
+.thumb img{width:100%;height:100%;object-fit:contain;display:block}
+.ph{color:var(--muted);font-weight:700;font-size:20px;text-align:center}.ph small{display:block;font-size:11px;font-weight:400}
+.meta{padding:7px 10px 9px}
+.name{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dir{color:var(--accent);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;direction:rtl;text-align:left}
+.dir:hover{text-decoration:underline}
+.sub{display:flex;justify-content:space-between;gap:6px;color:var(--muted);font-size:12px}
+.badge,.tag{position:absolute;top:7px;font-size:10px;font-weight:700;padding:2px 6px;border-radius:5px;text-transform:uppercase;letter-spacing:.03em}
+.badge{left:7px;background:rgba(0,0,0,.6);color:#fff}
+.tag{right:7px;background:var(--new);color:#04130a}.tag.upd{background:var(--upd)}
+.hidden{display:none!important}
+#empty{color:var(--muted);text-align:center;padding:80px 16px}
+#lb{position:fixed;inset:0;z-index:10;background:rgba(8,9,12,.94);display:none;flex-direction:column}
+#lb.open{display:flex}
+#lbStage{flex:1;min-height:0;position:relative;overflow:hidden;touch-action:none}
+#lbStage canvas{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:grab}
+#lbStage img{position:absolute;left:0;top:0;transform-origin:0 0;max-width:none;user-select:none;-webkit-user-drag:none;opacity:0}
+#lbZoom{color:#9aa3b2;font-size:12px;cursor:pointer;min-width:3.5em;text-align:right;font-variant-numeric:tabular-nums}
+.lbmsg{position:absolute;inset:0;display:grid;place-items:center;color:#aab}
+#lbBar{display:flex;gap:8px;align-items:center;padding:10px 16px;color:#eee;background:#14161c;border-top:1px solid #2a2f3a}
+#lbBar button{background:#1c2029;border-color:#2a2f3a;color:#eee}
+.lbtext{flex:1;min-width:0}
+#lbName{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#lbPath{font:12px ui-monospace,monospace;color:#9aa3b2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#lbInfo{color:#9aa3b2;font-size:12px;white-space:nowrap}
+@media (max-width:640px){#lbInfo{display:none}#size{display:none}}
+</style></head><body>
+<header>
+  <h1><span class="dot" id="dot"></span>Live Gallery</h1>
+  <form id="wf" autocomplete="off"><input id="watch" list="dl" spellcheck="false" title="Folder to watch, including all subfolders. Separate several with commas." placeholder="/path/to/folder  (comma-separate several)"><datalist id="dl"></datalist><button>Watch</button></form>
+  <span id="status"></span>
+  <div class="seg" id="seg"><button data-f="all" class="on">All</button><button data-f="image">Images</button><button data-f="model">3D</button></div>
+  <input type="search" id="q" placeholder="Filter by path  ( / )">
+  <input type="range" id="size" min="120" max="420" value="200" title="Thumbnail size">
+  <button id="follow" title="Open each new file full-size as it arrives">Follow</button>
+  <button id="pause" title="Hold new arrivals so the grid stops moving">Pause</button>
+  <span id="count"></span>
+</header>
+<main id="grid"></main>
+<div id="empty">Waiting for images or 3D files…</div>
+<div id="lb">
+  <div id="lbStage"></div>
+  <div id="lbBar">
+    <button id="lbPrev" title="Newer (←)">←</button><button id="lbNext" title="Older (→)">→</button>
+    <div class="lbtext"><div id="lbName"></div><div id="lbPath"></div></div>
+    <span id="lbZoom" title="Fit / 100% (0 / 1)"></span><span id="lbInfo"></span><button id="lbWatch" title="Watch only this file's folder">Watch this folder</button><button id="lbCopy">Copy path</button><button id="lbClose" title="Close (Esc)">✕</button>
+  </div>
+</div>
+<script type="module">
+const $ = s => document.querySelector(s);
+const grid = $('#grid'), cards = new Map();
+let filter = 'all', query = '', paused = false, follow = false, held = [], unseen = 0;
+
+const src = it => it.url + '?v=' + it.mtime;
+const fmtSize = b => b < 1024 ? b + ' B' : b < 1048576 ? (b / 1024).toFixed(0) + ' KB' : (b / 1048576).toFixed(1) + ' MB';
+function ago(t) {
+  const s = Math.max(0, Date.now() / 1000 - t);
+  if (s < 10) return 'just now'; if (s < 60) return Math.floor(s) + 's ago';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago'; if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+  return new Date(t * 1000).toLocaleDateString();
+}
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+const matches = it => (filter === 'all' || it.kind === filter) && (!query || it.rel.toLowerCase().includes(query));
+
+function makeCard(it, fresh) {
+  const c = el('div', 'card'); c.dataset.id = it.id;
+  const th = el('div', 'thumb');
+  if (it.kind === 'image') { const img = new Image(); img.loading = 'lazy'; img.decoding = 'async'; img.alt = it.name; img.src = src(it); th.append(img); }
+  else { th.append(el('div', 'ph', it.ext.toUpperCase())); th._it = it; thumbObserver.observe(th); }
+  c.append(th, el('span', 'badge', it.ext));
+  const meta = el('div', 'meta');
+  meta.append(el('div', 'name', it.name));
+  const dir = el('div', 'dir'); dir.append(el('bdi', null, (it.dir || '.') + '/')); dir.title = 'Show only this folder';
+  dir.onclick = e => { e.stopPropagation(); $('#q').value = it.dir; setQuery(it.dir); };
+  const sub = el('div', 'sub'); const a = el('span', 'ago', ago(it.mtime)); a.dataset.t = it.mtime;
+  sub.append(a, el('span', null, fmtSize(it.size)));
+  meta.append(dir, sub); c.append(meta);
+  if (fresh) {
+    c.classList.add('fresh'); if (fresh === 'update') c.classList.add('upd');
+    c.append(el('span', 'tag' + (fresh === 'update' ? ' upd' : ''), fresh === 'update' ? 'updated' : 'new'));
+    setTimeout(() => c.classList.remove('fresh'), 20000);
+  }
+  c.onclick = () => openLb(it.id);
+  c.classList.toggle('hidden', !matches(it));
+  return c;
+}
+
+function apply(ev) {
+  if (ev.type === 'remove') {
+    const c = cards.get(ev.id); if (c) { c.el.remove(); cards.delete(ev.id); }
+  } else {
+    const it = ev.item, old = cards.get(it.id);
+    if (old) old.el.remove();
+    const c = makeCard(it, ev.type); cards.set(it.id, { it, el: c }); grid.prepend(c);
+    if (document.hidden) { unseen++; document.title = `(${unseen}) Live Gallery`; }
+    if (lbId === it.id || (follow && matches(it))) openLb(it.id);
+  }
+  counts();
+}
+function counts() {
+  let v = 0; for (const { el } of cards.values()) if (!el.classList.contains('hidden')) v++;
+  $('#count').textContent = v === cards.size ? `${v} files` : `${v} of ${cards.size}`;
+  $('#empty').classList.toggle('hidden', v > 0);
+  $('#empty').textContent = cards.size ? 'Nothing matches the filter.' : 'Waiting for images or 3D files…';
+}
+function refilter() { for (const { it, el } of cards.values()) el.classList.toggle('hidden', !matches(it)); counts(); }
+function setQuery(v) { query = v.trim().toLowerCase(); refilter(); }
+
+let roots = [], recent = [], indexing = false;
+const rootsText = r => r.join(', ');
+function status(text, err) { $('#status').textContent = text; $('#status').classList.toggle('err', !!err); }
+async function load() {
+  const d = await (await fetch('/api/list')).json();
+  roots = d.roots; recent = d.recent || []; indexing = d.indexing;
+  if (document.activeElement !== $('#watch')) $('#watch').value = rootsText(roots);
+  document.title = 'Live Gallery · ' + roots.map(r => r.split(/[\\/]/).filter(Boolean).pop() || r).join(', ');
+  status(indexing ? 'indexing…' : (d.total > d.items.length ? `newest ${d.items.length} of ${d.total}` : d.mode));
+  $('#status').title = d.mode;
+  grid.replaceChildren(); cards.clear(); held = []; pauseLabel();
+  for (const it of d.items) { const c = makeCard(it, null); cards.set(it.id, { it, el: c }); grid.append(c); }
+  counts();
+  if (indexing) $('#empty').textContent = 'Indexing ' + rootsText(roots) + ' …';
+  if (!$('#watch').value || document.activeElement !== $('#watch')) showRecent();
+}
+function connect() {
+  const es = new EventSource('/events'); let broke = false;
+  es.onopen = () => { $('#dot').className = 'dot live'; $('#dot').title = 'live'; if (broke) load(); broke = false; };
+  es.onerror = () => { $('#dot').className = 'dot'; $('#dot').title = 'disconnected, retrying'; broke = true; };
+  es.onmessage = e => {
+    const ev = JSON.parse(e.data);
+    if (ev.type === 'reset') { closeLb(); load(); return; }
+    if (paused && ev.type !== 'remove') { held.push(ev); pauseLabel(); } else apply(ev);
+  };
+}
+
+// ---------- choosing folders ----------
+async function watch(value) {
+  const list = value.split(',').map(s => s.trim()).filter(Boolean);
+  if (!list.length) return status('enter a folder path', true);
+  status('switching…');
+  const r = await fetch('/api/watch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ roots: list }) });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) return status(d.error || 'failed', true);
+  $('#watch').blur(); $('#watch').value = rootsText(d.roots);
+  const u = new URL(location.href); u.searchParams.set('watch', rootsText(d.roots)); history.replaceState(null, '', u);
+}
+function fillList(values) { $('#dl').replaceChildren(...values.map(v => Object.assign(document.createElement('option'), { value: v }))); }
+function showRecent() { fillList(recent.map(rootsText)); }
+let acTimer;
+$('#watch').oninput = e => {
+  clearTimeout(acTimer);
+  const v = e.target.value, i = v.lastIndexOf(','), head = i < 0 ? '' : v.slice(0, i + 1) + ' ', last = v.slice(i + 1).trim();
+  if (!last) return showRecent();
+  acTimer = setTimeout(async () => {
+    const d = await (await fetch('/api/dirs?prefix=' + encodeURIComponent(last))).json();
+    if ($('#watch').value === v) fillList(d.dirs.map(p => head + p));
+  }, 120);
+};
+$('#watch').onfocus = e => { if (e.target.value === rootsText(roots)) e.target.select(); };
+$('#watch').onkeydown = e => { if (e.key === 'Escape') { e.target.value = rootsText(roots); e.target.blur(); } };
+$('#wf').onsubmit = e => { e.preventDefault(); watch($('#watch').value); };
+
+// ---------- controls ----------
+$('#seg').onclick = e => { const b = e.target.closest('button'); if (!b) return; filter = b.dataset.f; for (const x of $('#seg').children) x.classList.toggle('on', x === b); refilter(); };
+$('#q').oninput = e => setQuery(e.target.value);
+function setSize(v) { grid.style.setProperty('--size', v + 'px'); try { localStorage.setItem('lg-size', v); } catch {} }
+try { const v = localStorage.getItem('lg-size'); if (v) { $('#size').value = v; setSize(v); } } catch {}
+$('#size').oninput = e => setSize(e.target.value);
+$('#follow').onclick = () => { follow = !follow; $('#follow').classList.toggle('on', follow); };
+function pauseLabel() { $('#pause').textContent = paused ? (held.length ? `Resume (${held.length} new)` : 'Resume') : 'Pause'; $('#pause').classList.toggle('on', paused); }
+$('#pause').onclick = () => { paused = !paused; if (!paused) { const h = held; held = []; h.forEach(apply); } pauseLabel(); };
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { unseen = 0; document.title = 'Live Gallery'; } });
+setInterval(() => { for (const a of document.querySelectorAll('.ago')) a.textContent = ago(+a.dataset.t); }, 15000);
+
+// ---------- three.js (loaded lazily, so images work even offline) ----------
+let T;
+async function three() {
+  if (T) return T;
+  const [THREE, { OrbitControls }, { GLTFLoader }, { DRACOLoader }, { MeshoptDecoder }, { OBJLoader }, { STLLoader }, { PLYLoader }, { FBXLoader }, { RoomEnvironment }] = await Promise.all([
+    import('three'), import('three/addons/controls/OrbitControls.js'), import('three/addons/loaders/GLTFLoader.js'),
+    import('three/addons/loaders/DRACOLoader.js'), import('three/addons/libs/meshopt_decoder.module.js'),
+    import('three/addons/loaders/OBJLoader.js'), import('three/addons/loaders/STLLoader.js'),
+    import('three/addons/loaders/PLYLoader.js'), import('three/addons/loaders/FBXLoader.js'),
+    import('three/addons/environments/RoomEnvironment.js')]);
+  const draco = new DRACOLoader(); draco.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.6/');
+  const gltf = new GLTFLoader(); gltf.setDRACOLoader(draco); gltf.setMeshoptDecoder(MeshoptDecoder);
+  T = { THREE, OrbitControls, RoomEnvironment, L: { gltf, glb: gltf, obj: new OBJLoader(), stl: new STLLoader(), ply: new PLYLoader(), fbx: new FBXLoader() } };
+  return T;
+}
+async function loadModel(it) {
+  const { THREE, L } = await three(); const url = src(it), x = it.ext;
+  if (x === 'glb' || x === 'gltf') return (await L.gltf.loadAsync(url)).scene;
+  if (x === 'obj' || x === 'fbx') return await L[x].loadAsync(url);
+  const geo = await L[x].loadAsync(url); const colored = !!geo.attributes.color;
+  if (x === 'ply' && !geo.index) {           // point cloud
+    geo.computeBoundingSphere();
+    return new THREE.Points(geo, new THREE.PointsMaterial({ size: geo.boundingSphere.radius / 200, vertexColors: colored, color: colored ? 0xffffff : 0xb8c0cc }));
+  }
+  if (!geo.attributes.normal) geo.computeVertexNormals();
+  return new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: colored ? 0xffffff : 0xb8c0cc, vertexColors: colored, roughness: .55, metalness: .1 }));
+}
+function stage(renderer) {
+  const { THREE, RoomEnvironment } = T, scene = new THREE.Scene(), pm = new THREE.PMREMGenerator(renderer);
+  scene.environment = pm.fromScene(new RoomEnvironment(), 0.04).texture; pm.dispose();
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 0.6));
+  const d = new THREE.DirectionalLight(0xffffff, 1.2); d.position.set(3, 5, 4); scene.add(d);
+  return scene;
+}
+function frame(cam, obj, ctl) {
+  const { THREE } = T, box = new THREE.Box3().setFromObject(obj); if (box.isEmpty()) return;
+  const c = box.getCenter(new THREE.Vector3()), r = box.getSize(new THREE.Vector3()).length() / 2 || 1;
+  const dist = r / Math.sin(THREE.MathUtils.degToRad(cam.fov / 2));
+  cam.position.copy(c).addScaledVector(new THREE.Vector3(1, .7, 1.2).normalize(), dist * 1.02);
+  cam.near = dist / 100; cam.far = dist * 100; cam.updateProjectionMatrix(); cam.lookAt(c);
+  if (ctl) { ctl.target.copy(c); ctl.update(); }
+}
+function dispose(obj) {
+  obj.traverse(o => {
+    o.geometry?.dispose();
+    for (const m of [].concat(o.material || [])) { for (const k in m) if (m[k]?.isTexture) m[k].dispose(); m.dispose(); }
+  });
+}
+
+// 3D thumbnails: one shared offscreen renderer, rendered only when the card scrolls into view
+let TK; const thumbQ = []; let busy = false;
+const thumbObserver = new IntersectionObserver(es => { for (const e of es) if (e.isIntersecting) { thumbObserver.unobserve(e.target); thumbQ.push(e.target); pump(); } }, { rootMargin: '300px' });
+async function pump() {
+  if (busy) return; busy = true;
+  while (thumbQ.length) {
+    const th = thumbQ.shift(); if (!th.isConnected) continue;
+    try {
+      await three();
+      if (!TK) { const r = new T.THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true }); r.setSize(384, 384, false); TK = { r, scene: stage(r), cam: new T.THREE.PerspectiveCamera(35, 1, .01, 1000) }; }
+      const obj = await loadModel(th._it); TK.scene.add(obj); frame(TK.cam, obj);
+      TK.r.render(TK.scene, TK.cam); const img = new Image(); img.src = TK.r.domElement.toDataURL('image/png');
+      TK.scene.remove(obj); dispose(obj); th.replaceChildren(img);
+    } catch (e) { console.warn('thumbnail failed', th._it?.rel, e); th.firstChild?.append(el('small', null, 'no preview')); }
+  }
+  busy = false;
+}
+
+// ---------- lightbox ----------
+let lbId = null, viewer = null;
+const visibleIds = () => [...grid.children].filter(e => !e.classList.contains('hidden')).map(e => e.dataset.id);
+function closeViewer() { if (viewer) { viewer.close(); viewer = null; } }
+function closeLb() { closeViewer(); zoom = null; lbId = null; $('#lb').classList.remove('open'); $('#lbStage').replaceChildren(); }
+async function openLb(id) {
+  const c = cards.get(id); if (!c) return; const it = c.it;
+  const keep = lbId === id && zoom ? { ...zoom } : null; zoom = null; $('#lbZoom').textContent = ''; lbId = id;
+  c.el.querySelector('.tag')?.remove();
+  closeViewer(); const st = $('#lbStage'); st.replaceChildren();
+  $('#lbName').textContent = it.name; $('#lbPath').textContent = it.abs; $('#lbPath').title = it.abs;
+  $('#lbInfo').textContent = `${fmtSize(it.size)} · ${new Date(it.mtime * 1000).toLocaleTimeString()}`;
+  $('#lb').classList.add('open');
+  if (it.kind === 'image') {
+    const img = new Image(); img.draggable = false; img.alt = it.name;
+    img.onload = () => { if (lbId === id && img.isConnected) zoomInit(img, keep); };
+    img.onerror = () => { if (img.isConnected) st.replaceChildren(el('div', 'lbmsg', 'Could not load image')); };
+    img.src = src(it); st.append(img); return;
+  }
+  const msg = el('div', 'lbmsg', 'Loading model…'); st.append(msg);
+  let obj; try { obj = await loadModel(it); } catch (e) { msg.textContent = 'Could not load model: ' + (e.message || e); return; }
+  if (lbId !== id || viewer) { dispose(obj); return; }
+  msg.remove(); viewer = makeViewer(st, obj);
+}
+function makeViewer(st, obj) {
+  const { THREE, OrbitControls } = T;
+  const r = new THREE.WebGLRenderer({ antialias: true, alpha: true }); r.setPixelRatio(devicePixelRatio);
+  st.append(r.domElement);
+  const scene = stage(r); scene.add(obj);
+  const cam = new THREE.PerspectiveCamera(35, 1, .01, 1000), ctl = new OrbitControls(cam, r.domElement); ctl.enableDamping = true;
+  frame(cam, obj, ctl);
+  const fit = () => { const w = st.clientWidth || 1, h = st.clientHeight || 1; r.setSize(w, h, false); cam.aspect = w / h; cam.updateProjectionMatrix(); };
+  const ro = new ResizeObserver(fit); ro.observe(st); fit();
+  let raf; const loop = () => { raf = requestAnimationFrame(loop); ctl.update(); r.render(scene, cam); }; loop();
+  return { close() { cancelAnimationFrame(raf); ro.disconnect(); ctl.dispose(); dispose(obj); scene.environment?.dispose(); r.dispose(); r.forceContextLoss(); r.domElement.remove(); } };
+}
+function step(d) { const ids = visibleIds(), i = ids.indexOf(lbId); if (i < 0) return; const n = ids[i + d]; if (n) openLb(n); }
+$('#lbPrev').onclick = () => step(-1); $('#lbNext').onclick = () => step(1); $('#lbClose').onclick = closeLb;
+// ---------- image zoom: click image = 100% / fit, wheel = zoom at cursor, drag = pan ----------
+// Clicking the backdrop (or a 3D model without dragging) closes the viewer.
+let zoom = null, downAt = null, drag = null;
+const stg = $('#lbStage'), near = (a, b) => Math.abs(a - b) < 1e-3;
+const fitScale = z => Math.min(stg.clientWidth / z.w, stg.clientHeight / z.h) || 1;
+function zoomApply() {
+  const z = zoom; if (!z) return;
+  const W = stg.clientWidth, H = stg.clientHeight, sw = z.w * z.s, sh = z.h * z.s;
+  z.x = sw <= W ? (W - sw) / 2 : Math.min(0, Math.max(W - sw, z.x));
+  z.y = sh <= H ? (H - sh) / 2 : Math.min(0, Math.max(H - sh, z.y));
+  z.img.style.transform = `translate(${z.x}px,${z.y}px) scale(${z.s})`;
+  z.img.style.imageRendering = z.s >= 2 ? 'pixelated' : 'auto';
+  z.img.style.cursor = drag?.moved ? 'grabbing' : near(z.s, z.fit) ? 'zoom-in' : 'grab';
+  $('#lbZoom').textContent = Math.round(z.s * 100) + '%';
+}
+function zoomInit(img, keep) {
+  const z = { img, w: img.naturalWidth || 1024, h: img.naturalHeight || 1024, x: 0, y: 0 };
+  img.style.width = z.w + 'px'; img.style.height = z.h + 'px';
+  z.fit = fitScale(z); z.s = z.fit;
+  if (keep && keep.w === z.w && keep.h === z.h && !near(keep.s, keep.fit)) Object.assign(z, { s: keep.s, x: keep.x, y: keep.y });
+  zoom = z; zoomApply(); img.style.opacity = 1;
+}
+function zoomTo(s, cx, cy) {  // keeps the image point under (cx, cy) in place
+  const z = zoom; if (!z) return;
+  s = Math.min(Math.max(z.fit, 1) * 16, Math.max(z.fit, s));
+  const r = s / z.s; z.x = cx - (cx - z.x) * r; z.y = cy - (cy - z.y) * r; z.s = s; zoomApply();
+}
+function zoomToggle(cx = stg.clientWidth / 2, cy = stg.clientHeight / 2) {
+  if (!zoom) return;
+  if (near(zoom.s, zoom.fit)) zoomTo(zoom.fit < 1 ? 1 : zoom.fit * 2, cx, cy); else { zoom.s = zoom.fit; zoomApply(); }
+}
+new ResizeObserver(() => { if (!zoom) return; const was = near(zoom.s, zoom.fit); zoom.fit = fitScale(zoom); if (was) zoom.s = zoom.fit; zoomApply(); }).observe(stg);
+const local = e => { const r = stg.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+stg.addEventListener('wheel', e => { if (!zoom) return; e.preventDefault(); zoomTo(zoom.s * Math.exp(-e.deltaY * 0.0015), ...local(e)); }, { passive: false });
+stg.addEventListener('pointerdown', e => {
+  downAt = [e.clientX, e.clientY];
+  if (zoom && e.target === zoom.img && e.button === 0) { e.preventDefault(); zoom.img.setPointerCapture(e.pointerId); drag = { x: e.clientX, y: e.clientY, ox: zoom.x, oy: zoom.y, moved: false }; }
+});
+stg.addEventListener('pointermove', e => {
+  if (!drag || !zoom) return;
+  drag.moved ||= Math.hypot(e.clientX - drag.x, e.clientY - drag.y) > 6;
+  zoom.x = drag.ox + e.clientX - drag.x; zoom.y = drag.oy + e.clientY - drag.y; zoomApply();
+});
+const endDrag = () => { if (drag) { drag = null; zoomApply(); } };
+stg.addEventListener('pointerup', endDrag); stg.addEventListener('pointercancel', endDrag);
+stg.addEventListener('click', e => {
+  if (downAt && Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 6) return;  // that was a drag
+  if (zoom && e.target === zoom.img) return zoomToggle(...local(e));
+  closeLb();
+});
+$('#lbZoom').onclick = () => zoomToggle();
+$('#lbWatch').onclick = () => { const it = cards.get(lbId)?.it; if (it) watch(it.absdir); };
+$('#lbCopy').onclick = async () => { try { await navigator.clipboard.writeText($('#lbPath').textContent); $('#lbCopy').textContent = 'Copied'; setTimeout(() => $('#lbCopy').textContent = 'Copy path', 1200); } catch {} };
+document.addEventListener('keydown', e => {
+  if (lbId) { if (zoom && e.key === '1') zoomTo(1, stg.clientWidth / 2, stg.clientHeight / 2); else if (zoom && e.key === '0') { zoom.s = zoom.fit; zoomApply(); } else if (e.key === 'Escape') closeLb(); else if (e.key === 'ArrowLeft') step(-1); else if (e.key === 'ArrowRight') step(1); return; }
+  if (e.key === '/' && document.activeElement !== $('#q')) { e.preventDefault(); $('#q').focus(); }
+});
+
+(async () => {
+  // ?watch=/some/path (comma-separate several) makes a bookmarkable link to a folder
+  const want = new URL(location.href).searchParams.get('watch');
+  await load();
+  if (want && want !== rootsText(roots)) await watch(want);
+  connect();
+})();
+</script></body></html>
+"""
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Live, recursive gallery of new images and 3D models.")
+    ap.add_argument("dirs", nargs="*", help="folders to watch (default: the last folder picked in the page, "
+                                            "else --default, else the current folder)")
+    ap.add_argument("--default", help="folder to watch when no DIR is given and none was picked yet")
+    ap.add_argument("-p", "--port", type=int, default=None, help="port (default 8765, or the next free one)")
+    ap.add_argument("-i", "--interval", type=float, default=1.0, help="seconds between scans (default 1)")
+    ap.add_argument("-n", "--initial", type=int, default=150, help="existing files to show at start, newest first")
+    ap.add_argument("-x", "--exclude", action="append", default=[], help="folder name to skip (repeatable)")
+    ap.add_argument("--poll", action="store_true", help="poll instead of using inotify")
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--open", action="store_true", help="open the browser")
+    a = ap.parse_args()
+
+    app = App(a.interval, a.exclude, a.poll, a.initial)
+    if a.dirs:
+        roots, bad = norm_roots(a.dirs)
+        if bad:
+            sys.exit("not a directory: " + ", ".join(bad))
+    else:
+        roots = norm_roots(app.state.get("roots") or [])[0] or norm_roots([a.default or "."])[0]
+        if not roots:
+            sys.exit(f"not a directory: {a.default}")
+    app.set_roots(roots, save=False)  # indexes in the background; the page shows progress
+
+    srv = None
+    ports = [a.port] if a.port else range(8765, 8785)
+    for port in ports:
+        try:
+            srv = ThreadingHTTPServer((a.host, port), make_handler(app))
+            break
+        except OSError:
+            continue
+    if not srv:
+        sys.exit(f"port unavailable: {a.port or '8765-8784'}")
+    srv.daemon_threads = True
+    host = "localhost" if a.host in ("127.0.0.1", "0.0.0.0") else a.host
+    url = f"http://{host}:{srv.server_address[1]}/"
+    print(f"Live Gallery: {url}   (change folders in the page; Ctrl+C to stop)", flush=True)
+    if a.open:
+        webbrowser.open(url)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print()
+
+
+if __name__ == "__main__":
+    main()
