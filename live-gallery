@@ -153,7 +153,7 @@ class Watcher:
         full = os.path.join(self.roots[ri], *rel.split("/"))
         return {"id": f"{ri}/{rel}", "rel": rel, "dir": d, "name": name, "kind": kind,
                 "ext": ext[1:], "size": size, "mtime": mtime,
-                "abs": full, "absdir": os.path.dirname(full),
+                "root": ri, "abs": full, "absdir": os.path.dirname(full),
                 "url": f"/f/{ri}/" + urllib.parse.quote(rel)}
 
     def broadcast(self, ev):
@@ -308,7 +308,10 @@ def norm_roots(paths):
             bad.append(p)
         elif r not in roots:
             roots.append(r)
-    return roots, bad
+    # a folder inside another watched folder is already covered; keep the outer one
+    def inside(a, b):
+        return a != b and os.path.normcase(a).startswith(os.path.normcase(b.rstrip(os.sep)) + os.sep)
+    return [r for r in roots if not any(inside(r, o) for o in roots)], bad
 
 
 def complete_dirs(prefix, limit=40):
@@ -536,7 +539,12 @@ body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 system-ui,san
 header{position:sticky;top:0;z-index:5;display:flex;flex-wrap:wrap;gap:8px 10px;align-items:center;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
 h1{font-size:15px;margin:0;display:flex;align-items:center;gap:8px;white-space:nowrap}
 .dot{width:9px;height:9px;border-radius:50%;background:#ef4444}.dot.live{background:var(--new)}
-#wf{display:flex;gap:6px;flex:1 1 340px;min-width:0}
+#roots{display:flex;flex-wrap:wrap;gap:6px;min-width:0}
+.chip{display:inline-flex;align-items:center;max-width:100%;border:1px solid var(--line);border-radius:999px;background:var(--card);font:12px ui-monospace,monospace}
+.chip button{border:0;background:none;padding:3px 9px;font:inherit;border-radius:999px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chip .x{padding:3px 9px 3px 0;color:var(--muted)}.chip .x:hover{color:#ef4444}
+.chip.on{border-color:var(--accent)}.chip.on .nm{color:var(--accent)}
+#wf{display:flex;gap:6px;flex:1 1 220px;min-width:0}
 #watch{flex:1;min-width:0;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:5px 10px;font:12px ui-monospace,monospace}
 #watch:focus,input[type=search]:focus{outline:2px solid var(--accent);outline-offset:-1px}
 #status{color:var(--muted);font-size:12px;white-space:nowrap}#status.err{color:#ef4444}
@@ -579,7 +587,8 @@ input[type=search]{background:var(--card);border:1px solid var(--line);border-ra
 </style></head><body>
 <header>
   <h1><span class="dot" id="dot"></span>Live Gallery</h1>
-  <form id="wf" autocomplete="off"><input id="watch" list="dl" spellcheck="false" title="Folder to watch, including all subfolders. Separate several with commas." placeholder="/path/to/folder  (comma-separate several)"><datalist id="dl"></datalist><button>Watch</button></form>
+  <div id="roots"></div>
+  <form id="wf" autocomplete="off"><input id="watch" list="dl" spellcheck="false" title="Add a folder to watch (all its subfolders are included)" placeholder="Add a folder…"><datalist id="dl"></datalist><button>Add</button></form>
   <span id="status"></span>
   <div class="seg" id="seg"><button data-f="all" class="on">All</button><button data-f="image">Images</button><button data-f="model">3D</button></div>
   <input type="search" id="q" placeholder="Filter by path  ( / )">
@@ -595,7 +604,7 @@ input[type=search]{background:var(--card);border:1px solid var(--line);border-ra
   <div id="lbBar">
     <button id="lbPrev" title="Newer (←)">←</button><button id="lbNext" title="Older (→)">→</button>
     <div class="lbtext"><div id="lbName"></div><div id="lbPath"></div></div>
-    <span id="lbZoom" title="Fit / 100% (0 / 1)"></span><span id="lbInfo"></span><button id="lbWatch" title="Watch only this file's folder">Watch this folder</button><button id="lbCopy">Copy path</button><button id="lbClose" title="Close (Esc)">✕</button>
+    <span id="lbZoom" title="Fit / 100% (0 / 1)"></span><span id="lbInfo"></span><button id="lbWatch" title="Replace the watched folders with just this file's folder">Watch only this folder</button><button id="lbCopy">Copy path</button><button id="lbClose" title="Close (Esc)">✕</button>
   </div>
 </div>
 <script type="module">
@@ -612,7 +621,7 @@ function ago(t) {
   return new Date(t * 1000).toLocaleDateString();
 }
 function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
-const matches = it => (filter === 'all' || it.kind === filter) && (!query || it.rel.toLowerCase().includes(query));
+const matches = it => (filter === 'all' || it.kind === filter) && (rootFilter === null || it.root === rootFilter) && (!query || it.rel.toLowerCase().includes(query));
 
 function makeCard(it, fresh) {
   const c = el('div', 'card'); c.dataset.id = it.id;
@@ -622,8 +631,9 @@ function makeCard(it, fresh) {
   c.append(th, el('span', 'badge', it.ext));
   const meta = el('div', 'meta');
   meta.append(el('div', 'name', it.name));
-  const dir = el('div', 'dir'); dir.append(el('bdi', null, (it.dir || '.') + '/')); dir.title = 'Show only this folder';
-  dir.onclick = e => { e.stopPropagation(); $('#q').value = it.dir; setQuery(it.dir); };
+  const dir = el('div', 'dir'), where = [roots.length > 1 ? labels[it.root] : '', it.dir].filter(Boolean).join('/');
+  dir.append(el('bdi', null, (where || '.') + '/')); dir.title = 'Show only this folder\n' + it.absdir;
+  dir.onclick = e => { e.stopPropagation(); if (roots.length > 1) { rootFilter = it.root; renderChips(); } $('#q').value = it.dir; setQuery(it.dir); };
   const sub = el('div', 'sub'); const a = el('span', 'ago', ago(it.mtime)); a.dataset.t = it.mtime;
   sub.append(a, el('span', null, fmtSize(it.size)));
   meta.append(dir, sub); c.append(meta);
@@ -658,21 +668,33 @@ function counts() {
 function refilter() { for (const { it, el } of cards.values()) el.classList.toggle('hidden', !matches(it)); counts(); }
 function setQuery(v) { query = v.trim().toLowerCase(); refilter(); }
 
-let roots = [], recent = [], indexing = false;
+let roots = [], recent = [], labels = [], indexing = false, rootFilter = null;
 const rootsText = r => r.join(', ');
+const segs = p => p.split(/[\\/]/).filter(Boolean);
+function shortLabels(list) {  // last folder name, plus parents only where two folders would look the same
+  return list.map((r, i) => {
+    const parts = segs(r);
+    for (let n = 1; n <= parts.length; n++) {
+      const name = parts.slice(-n).join('/');
+      if (!list.some((o, j) => j !== i && segs(o).slice(-n).join('/') === name)) return name;
+    }
+    return r;
+  });
+}
 function status(text, err) { $('#status').textContent = text; $('#status').classList.toggle('err', !!err); }
 async function load() {
   const d = await (await fetch('/api/list')).json();
-  roots = d.roots; recent = d.recent || []; indexing = d.indexing;
-  if (document.activeElement !== $('#watch')) $('#watch').value = rootsText(roots);
-  document.title = 'Live Gallery · ' + roots.map(r => r.split(/[\\/]/).filter(Boolean).pop() || r).join(', ');
+  if (rootsText(d.roots) !== rootsText(roots)) rootFilter = null;
+  roots = d.roots; recent = d.recent || []; indexing = d.indexing; labels = shortLabels(roots);
+  document.title = 'Live Gallery · ' + labels.join(', ');
   status(indexing ? 'indexing…' : (d.total > d.items.length ? `newest ${d.items.length} of ${d.total}` : d.mode));
   $('#status').title = d.mode;
+  renderChips();
   grid.replaceChildren(); cards.clear(); held = []; pauseLabel();
   for (const it of d.items) { const c = makeCard(it, null); cards.set(it.id, { it, el: c }); grid.append(c); }
   counts();
-  if (indexing) $('#empty').textContent = 'Indexing ' + rootsText(roots) + ' …';
-  if (!$('#watch').value || document.activeElement !== $('#watch')) showRecent();
+  if (indexing) $('#empty').textContent = 'Indexing ' + labels.join(', ') + ' …';
+  if (!$('#watch').value) showRecent();
 }
 function connect() {
   const es = new EventSource('/events'); let broke = false;
@@ -685,19 +707,37 @@ function connect() {
   };
 }
 
-// ---------- choosing folders ----------
-async function watch(value) {
-  const list = value.split(',').map(s => s.trim()).filter(Boolean);
+// ---------- choosing folders: chips (click = show only that folder, × = stop watching), box adds ----------
+function renderChips() {
+  const box = $('#roots'); box.replaceChildren();
+  roots.forEach((r, i) => {
+    const chip = el('span', 'chip' + (rootFilter === i ? ' on' : ''));
+    const nm = el('button', 'nm', labels[i]); nm.type = 'button';
+    nm.title = r + (roots.length > 1 ? (rootFilter === i ? '\nClick to show all folders' : '\nClick to show only this folder') : '');
+    nm.onclick = () => { if (roots.length < 2) return; rootFilter = rootFilter === i ? null : i; renderChips(); refilter(); };
+    chip.append(nm);
+    if (roots.length > 1) {
+      const x = el('button', 'x', '×'); x.type = 'button'; x.title = 'Stop watching ' + r;
+      x.onclick = () => setRoots(roots.filter((_, j) => j !== i));
+      chip.append(x);
+    }
+    box.append(chip);
+  });
+}
+async function setRoots(list) {
   if (!list.length) return status('enter a folder path', true);
   status('switching…');
   const r = await fetch('/api/watch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ roots: list }) });
   const d = await r.json().catch(() => ({}));
-  if (!r.ok) return status(d.error || 'failed', true);
-  $('#watch').blur(); $('#watch').value = rootsText(d.roots);
+  if (!r.ok) { status(d.error || 'failed', true); return false; }
   const u = new URL(location.href); u.searchParams.set('watch', rootsText(d.roots)); history.replaceState(null, '', u);
+  return true;
 }
+const splitPaths = v => v.split(',').map(s => s.trim()).filter(Boolean);
+const watch = v => setRoots(splitPaths(v));                      // replace all watched folders
+const addFolders = v => setRoots([...roots, ...splitPaths(v)]);  // add to them
 function fillList(values) { $('#dl').replaceChildren(...values.map(v => Object.assign(document.createElement('option'), { value: v }))); }
-function showRecent() { fillList(recent.map(rootsText)); }
+function showRecent() { const seen = new Set(roots); fillList(recent.flat().filter(p => !seen.has(p) && seen.add(p))); }
 let acTimer;
 $('#watch').oninput = e => {
   clearTimeout(acTimer);
@@ -708,9 +748,12 @@ $('#watch').oninput = e => {
     if ($('#watch').value === v) fillList(d.dirs.map(p => head + p));
   }, 120);
 };
-$('#watch').onfocus = e => { if (e.target.value === rootsText(roots)) e.target.select(); };
-$('#watch').onkeydown = e => { if (e.key === 'Escape') { e.target.value = rootsText(roots); e.target.blur(); } };
-$('#wf').onsubmit = e => { e.preventDefault(); watch($('#watch').value); };
+$('#watch').onkeydown = e => { if (e.key === 'Escape') { e.target.value = ''; e.target.blur(); showRecent(); } };
+$('#wf').onsubmit = async e => {
+  e.preventDefault(); const v = $('#watch').value;
+  if (!splitPaths(v).length) return status('type a folder path to add', true);
+  if (await addFolders(v)) { $('#watch').value = ''; $('#watch').blur(); }
+};
 
 // ---------- controls ----------
 $('#seg').onclick = e => { const b = e.target.closest('button'); if (!b) return; filter = b.dataset.f; for (const x of $('#seg').children) x.classList.toggle('on', x === b); refilter(); };
@@ -884,7 +927,8 @@ $('#lbWatch').onclick = () => { const it = cards.get(lbId)?.it; if (it) watch(it
 $('#lbCopy').onclick = async () => { try { await navigator.clipboard.writeText($('#lbPath').textContent); $('#lbCopy').textContent = 'Copied'; setTimeout(() => $('#lbCopy').textContent = 'Copy path', 1200); } catch {} };
 document.addEventListener('keydown', e => {
   if (lbId) { if (zoom && e.key === '1') zoomTo(1, stg.clientWidth / 2, stg.clientHeight / 2); else if (zoom && e.key === '0') { zoom.s = zoom.fit; zoomApply(); } else if (e.key === 'Escape') closeLb(); else if (e.key === 'ArrowLeft') step(-1); else if (e.key === 'ArrowRight') step(1); return; }
-  if (e.key === '/' && document.activeElement !== $('#q')) { e.preventDefault(); $('#q').focus(); }
+  const typing = e.target.closest?.('input, textarea, select, [contenteditable]');
+  if (e.key === '/' && !typing && !e.ctrlKey && !e.metaKey && !e.altKey) { e.preventDefault(); $('#q').focus(); }
 });
 
 (async () => {

@@ -25,8 +25,11 @@ Then open http://localhost:8765 (`--open` does it for you). You can change the f
 
 - **Live grid.** New files get a green **NEW** badge. Re-saved files jump back to the top marked **UPDATED**,
   and deleted files disappear. Files show up once they've finished writing, never half-saved.
-- **Folder box.** Type a path at the top. It autocompletes folders and remembers recent ones. Separate
-  several folders with commas. Or open a link with `?watch=/some/path` to bookmark a folder.
+- **Several folders at once.** Each watched folder is a chip at the top. Click a chip to show only that
+  folder, or click × to stop watching it. Use the **Add a folder…** box to add more: it autocompletes paths
+  and suggests recent folders. Every card shows which folder it came from. Folders already inside a watched
+  folder are skipped. You can also pass several on the command line (`live-gallery ~/a ~/b`) or bookmark
+  `?watch=/path/one,/path/two`.
 - **Filters.** All / Images / 3D. Filter by path (press `/`). Click a card's folder to show only that folder.
 - **Follow.** Each new file opens full-size as it arrives, so you can just watch.
 - **Pause.** Holds new arrivals so the grid stops moving while you look.
