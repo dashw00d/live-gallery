@@ -1,0 +1,516 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Live Gallery</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%231c2029'/%3E%3Ccircle cx='8' cy='8' r='3.5' fill='%234ade80'/%3E%3C/svg%3E">
+<style>
+:root{--bg:#0f1115;--panel:#171a21;--card:#1c2029;--line:#2a2f3a;--text:#e6e8ec;--muted:#8b93a3;--accent:#6aa9ff;--new:#4ade80;--upd:#fbbf24;--c1:#242833;--c2:#1c2029;color-scheme:dark}
+@media (prefers-color-scheme:light){:root{--bg:#f3f4f7;--panel:#fff;--card:#fff;--line:#e2e5ea;--text:#1b1f27;--muted:#667085;--accent:#2563eb;--new:#16a34a;--upd:#d97706;--c1:#eceef2;--c2:#fff;color-scheme:light}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 system-ui,sans-serif}
+header{position:sticky;top:0;z-index:5;display:flex;flex-wrap:wrap;gap:8px 10px;align-items:center;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
+h1{font-size:15px;margin:0;display:flex;align-items:center;gap:8px;white-space:nowrap}
+.dot{width:9px;height:9px;border-radius:50%;background:#ef4444}.dot.live{background:var(--new)}
+#roots{display:flex;flex-wrap:wrap;gap:6px;min-width:0}
+.chip{display:inline-flex;align-items:center;max-width:100%;border:1px solid var(--line);border-radius:999px;background:var(--card);font:12px ui-monospace,monospace}
+.chip button{border:0;background:none;padding:3px 9px;font:inherit;border-radius:999px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chip .x{padding:3px 9px 3px 0;color:var(--muted)}.chip .x:hover{color:#ef4444}
+.chip.on{border-color:var(--accent)}.chip.on .nm{color:var(--accent)}
+#wf{display:flex;gap:6px;flex:1 1 220px;min-width:0}
+#watch{flex:1;min-width:0;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:5px 10px;font:12px ui-monospace,monospace}
+#watch:focus,input[type=search]:focus{outline:2px solid var(--accent);outline-offset:-1px}
+#status{color:var(--muted);font-size:12px;white-space:nowrap}#status.err{color:#ef4444}#status:empty{display:none}
+button,input{font:inherit;color:var(--text)}
+button{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:5px 10px;cursor:pointer}
+button:hover{border-color:var(--muted)}
+button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.seg{display:flex}.seg button{border-radius:0;margin-left:-1px}.seg button:first-child{border-radius:8px 0 0 8px}.seg button:last-child{border-radius:0 8px 8px 0}
+input[type=search]{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:5px 10px;width:210px;max-width:100%}
+#count{color:var(--muted);font-size:12px;white-space:nowrap;font-variant-numeric:tabular-nums}
+#grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--size,200px),1fr));gap:12px;padding:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden;cursor:pointer;position:relative;transition:box-shadow .6s,border-color .6s}
+.card:hover{border-color:var(--muted)}
+.card.fresh{border-color:var(--new);box-shadow:0 0 0 2px var(--new);animation:pop .22s ease-out}.card.fresh.upd{border-color:var(--upd);box-shadow:0 0 0 2px var(--upd)}
+@keyframes pop{from{opacity:0;transform:scale(.96)}}
+.thumb{aspect-ratio:1;display:grid;place-items:center;background:repeating-conic-gradient(var(--c1) 0 25%,var(--c2) 0 50%) 0 0/16px 16px;overflow:hidden}
+.thumb img{width:100%;height:100%;object-fit:contain;display:block;opacity:0;transition:opacity .18s}.thumb img.ready{opacity:1}
+.thumb.model{background:radial-gradient(circle at 50% 38%,#3b4252,#1b1f27)}.thumb.model .ph{color:#aab2c0}
+.thumb.pending .ph{animation:pulse 1.5s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.45}}
+.ph{color:var(--muted);font-weight:700;font-size:20px;text-align:center}.ph small{display:block;font-size:11px;font-weight:400}
+.meta{padding:7px 10px 9px}
+.name{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dir{color:var(--accent);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;direction:rtl;text-align:left}
+.dir:hover{text-decoration:underline}
+.sub{display:flex;justify-content:space-between;gap:6px;color:var(--muted);font-size:12px}
+.badge,.tag{position:absolute;top:7px;font-size:10px;font-weight:700;padding:2px 6px;border-radius:5px;text-transform:uppercase;letter-spacing:.03em}
+.badge{left:7px;background:rgba(0,0,0,.6);color:#fff}
+.tag{right:7px;background:var(--new);color:#04130a}.tag.upd{background:var(--upd)}
+.hidden{display:none!important}
+#empty{color:var(--muted);text-align:center;padding:80px 16px}
+#more{color:var(--muted);text-align:center;font-size:12px;padding:4px 16px 40px;min-height:1px}
+#lb{position:fixed;inset:0;z-index:10;background:rgba(8,9,12,.94);display:none;flex-direction:column}
+#lb.open{display:flex}
+#lbStage{flex:1;min-height:0;position:relative;overflow:hidden;touch-action:none}
+#lbStage canvas{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:grab}
+#lbStage img{position:absolute;left:0;top:0;transform-origin:0 0;max-width:none;user-select:none;-webkit-user-drag:none;opacity:0}
+#lbStage img.lbthumb{inset:0;width:100%;height:100%;object-fit:contain;opacity:.3;pointer-events:none}
+#lbZoom{color:#9aa3b2;font-size:12px;cursor:pointer;min-width:3.5em;text-align:right;font-variant-numeric:tabular-nums}
+.lbmsg{position:absolute;inset:0;display:grid;place-items:center;color:#cdd3de;font-variant-numeric:tabular-nums;pointer-events:none}
+#lbBar{display:flex;gap:8px;align-items:center;padding:10px 16px;color:#eee;background:#14161c;border-top:1px solid #2a2f3a}
+#lbBar button{background:#1c2029;border-color:#2a2f3a;color:#eee}
+.lbtext{flex:1;min-width:0}
+#lbName{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#lbPath{font:12px ui-monospace,monospace;color:#9aa3b2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#lbInfo{color:#9aa3b2;font-size:12px;white-space:nowrap}
+@media (max-width:640px){#lbInfo{display:none}#size{display:none}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style></head><body>
+<header>
+  <h1><span class="dot" id="dot"></span>Live Gallery</h1>
+  <div id="roots"></div>
+  <form id="wf" autocomplete="off"><input id="watch" list="dl" spellcheck="false" title="Add a folder to watch (all its subfolders are included)" placeholder="Add a folder…"><datalist id="dl"></datalist><button>Add</button></form>
+  <span id="status"></span>
+  <div class="seg" id="seg"><button data-f="all" class="on">All</button><button data-f="image">Images</button><button data-f="model">3D</button></div>
+  <input type="search" id="q" placeholder="Filter by path  ( / )">
+  <input type="range" id="size" min="120" max="420" value="200" title="Thumbnail size">
+  <button id="follow" title="Open each new file full-size as it arrives">Follow</button>
+  <button id="pause" title="Hold new arrivals so the grid stops moving">Pause</button>
+  <span id="count"></span>
+</header>
+<main id="grid"></main>
+<div id="empty">Waiting for images or 3D files…</div>
+<div id="more"></div>
+<div id="lb">
+  <div id="lbStage"></div>
+  <div id="lbBar">
+    <button id="lbPrev" title="Newer (←)">←</button><button id="lbNext" title="Older (→)">→</button>
+    <div class="lbtext"><div id="lbName"></div><div id="lbPath"></div></div>
+    <span id="lbZoom" title="Fit / 100% (0 / 1)"></span><span id="lbInfo"></span><button id="lbWatch" title="Replace the watched folders with just this file's folder">Watch only this folder</button><button id="lbCopy">Copy path</button><button id="lbClose" title="Close (Esc)">✕</button>
+  </div>
+</div>
+<script type="module">
+import { three, orbit, loadModel, stage, frame, dispose, thumbKit, drawThumb } from './kit.js';
+
+const $ = s => document.querySelector(s);
+const grid = $('#grid'), cards = new Map();  // id -> { it, el }; the grid holds the newest files, older ones load on scroll
+const THUMB = 512, KEEP = 300, TRIM_AT = 420;
+let filter = 'all', query = '', rootFilter = null, paused = false, follow = false, held = [], unseen = 0;
+let roots = [], recent = [], labels = [], indexing = false, total = 0, more = false, gen = 0, loadingMore = false;
+let baseTitle = 'Live Gallery', live = false, mode = '';
+
+const src = it => it.url + '?v=' + it.mtime;
+const fmtSize = b => b < 1024 ? b + ' B' : b < 1048576 ? (b / 1024).toFixed(0) + ' KB' : (b / 1048576).toFixed(1) + ' MB';
+function ago(t) {
+  const s = Math.max(0, Date.now() / 1000 - t);
+  if (s < 10) return 'just now'; if (s < 60) return Math.floor(s) + 's ago';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago'; if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+  return new Date(t * 1000).toLocaleDateString();
+}
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+// The server applies these filters to what it sends; this is the same test for live arrivals.
+const matches = it => (filter === 'all' || it.kind === filter) && (rootFilter === null || it.root === rootFilter) && (!query || it.rel.toLowerCase().includes(query));
+const filtered = () => filter !== 'all' || rootFilter !== null || !!query;
+
+// ---------- cards ----------
+function placeholder(it, note) { const p = el('div', 'ph', it.ext.toUpperCase()); p.append(el('small', null, note)); return p; }
+function makeCard(it, fresh) {
+  const c = el('div', 'card'); c.dataset.id = it.id;
+  const th = el('div', it.kind === 'model' ? 'thumb model' : 'thumb'); th._it = it;
+  const cached = it.kind === 'model' && it.thumb ? 't/' + it.tkey : null;  // saved 3D thumbnail
+  if (it.kind === 'image') {
+    const img = new Image(); img.loading = 'lazy'; img.decoding = 'async'; img.alt = it.name;
+    img.onload = () => img.classList.add('ready');
+    img.onerror = () => th.replaceChildren(placeholder(it, 'can’t display'));
+    img.src = src(it); th.append(img);
+  } else if (cached) {
+    const img = new Image(); img.loading = 'lazy'; img.decoding = 'async'; img.alt = it.name;
+    img.onload = () => img.classList.add('ready');
+    img.onerror = () => { th.replaceChildren(placeholder(it, fmtSize(it.size))); queueModel(th, false); };
+    img.src = cached; th.append(img);
+  } else { th.append(placeholder(it, fmtSize(it.size))); queueModel(th, !!fresh); }
+  c.append(th, el('span', 'badge', it.ext));
+  const meta = el('div', 'meta');
+  meta.append(el('div', 'name', it.name));
+  const dir = el('div', 'dir'), where = [roots.length > 1 ? labels[it.root] : '', it.dir].filter(Boolean).join('/');
+  dir.append(el('bdi', null, (where || '.') + '/')); dir.title = 'Show only this folder\n' + it.absdir;
+  dir.onclick = e => { e.stopPropagation(); if (roots.length > 1) { rootFilter = it.root; renderChips(); } $('#q').value = it.dir; setQuery(it.dir); };
+  const sub = el('div', 'sub'); const a = el('span', 'ago', ago(it.mtime)); a.dataset.t = it.mtime;
+  sub.append(a, el('span', null, fmtSize(it.size)));
+  meta.append(dir, sub); c.append(meta);
+  if (fresh) markFresh(c, fresh);
+  c.onclick = () => openLb(it.id);
+  return c;
+}
+function markFresh(c, type) {
+  c.classList.add('fresh'); if (type === 'update') c.classList.add('upd');
+  c.append(el('span', 'tag' + (type === 'update' ? ' upd' : ''), type === 'update' ? 'updated' : 'new'));
+  setTimeout(() => c.classList.remove('fresh'), 20000);
+}
+function revoke(th) { if (th?._blob) { URL.revokeObjectURL(th._blob); th._blob = null; } }
+function dropCard(id) { const c = cards.get(id); if (!c) return; revoke(c.el.firstChild); c.el.remove(); cards.delete(id); }
+function clearGrid() { for (const c of cards.values()) revoke(c.el.firstChild); grid.replaceChildren(); cards.clear(); thumbQ.length = 0; }
+
+// ---------- live events ----------
+// A few new files show up at once. A flood (a whole folder copied in) is collected until it pauses,
+// then shown in one go as the newest page, instead of building and loading a card for every file.
+const BULK = 60;
+let inbox = [], flushTimer = 0, inboxSince = 0, lastEvent = 0;
+const waiting = new Map();  // id -> 'add' | 'update': arrived in a flood while you were scrolled down
+function enqueue(ev) {
+  const now = performance.now();
+  if (!inbox.length) inboxSince = now;
+  inbox.push(ev); lastEvent = now;
+  if (!flushTimer) flushTimer = setTimeout(tryFlush, 40);
+}
+function tryFlush() {
+  flushTimer = 0; const now = performance.now();
+  if (inbox.length > 20 && now - lastEvent < 120 && now - inboxSince < 1500) { flushTimer = setTimeout(tryFlush, 120); return; }
+  flush();
+}
+const arrival = (a, b) => a.at - b.at || a.mtime - b.mtime || (a.id < b.id ? -1 : 1);
+function flush() {
+  const last = new Map(); for (const ev of inbox) last.set(ev.type === 'remove' ? ev.id : ev.item.id, ev);  // latest event per file
+  inbox = [];
+  const adds = []; let removed = 0;
+  for (const ev of last.values()) {
+    if (ev.type !== 'remove') { if (matches(ev.item)) adds.push(ev); continue; }
+    if (cards.has(ev.id) || matches(ev)) total = Math.max(0, total - 1);
+    if (cards.has(ev.id)) { dropCard(ev.id); removed++; }
+  }
+  if (removed && total > cards.size && adds.length <= BULK) {  // files went away: bring older ones back in
+    if (!cards.size && !adds.length) return load();
+    more = true; fillViewport();
+  }
+  if (document.hidden && adds.length) { unseen += adds.length; document.title = `(${unseen}) ${baseTitle}`; }
+  if (adds.length > BULK) return bulk(adds);
+  let open = null;
+  for (const ev of adds.sort((a, b) => arrival(a.item, b.item))) {
+    const it = ev.item;
+    if (cards.has(it.id)) dropCard(it.id); else if (ev.type === 'add') total++;
+    const c = makeCard(it, ev.type); cards.set(it.id, { it, el: c }); grid.prepend(c);
+    if (lbId === it.id || follow) open = it.id;
+  }
+  // Don't let a long session pile up thousands of cards; older ones come back when you scroll down.
+  if (cards.size > TRIM_AT && scrollY < innerHeight) { while (cards.size > KEEP) dropCard(grid.lastElementChild.dataset.id); more = true; }
+  counts();
+  if (open && cards.has(open)) openLb(open);
+}
+async function bulk(adds) {
+  if (scrollY > innerHeight) {  // you're looking at older files: don't yank the page, just say so
+    for (const ev of adds) { if (ev.type === 'add' && !cards.has(ev.item.id) && !waiting.has(ev.item.id)) total++; waiting.set(ev.item.id, ev.type); }
+    counts(); status(`↑ ${waiting.size} new files`); $('#status').title = 'Scroll to the top to see them';
+    return;
+  }
+  await reloadMarking(new Map(adds.map(ev => [ev.item.id, ev.type])));
+}
+async function reloadMarking(types) {
+  await load();
+  for (const [id, c] of cards) if (types.has(id)) markFresh(c.el, types.get(id));
+  if (follow && grid.firstElementChild) openLb(grid.firstElementChild.dataset.id);
+}
+function counts() {
+  const n = cards.size;
+  $('#count').textContent = total > n ? `${n} of ${total}` : `${n} file${n === 1 ? '' : 's'}`;
+  $('#empty').classList.toggle('hidden', n > 0);
+  $('#empty').textContent = indexing ? 'Indexing ' + labels.join(', ') + ' …' : filtered() ? 'Nothing matches the filter.' : 'Waiting for images or 3D files…';
+  $('#more').textContent = more ? 'Loading older files…' : n > 40 ? 'That’s everything.' : '';
+}
+
+// ---------- loading: newest page first, older pages as you scroll ----------
+const rootsText = r => r.join(', ');
+const segs = p => p.split(/[\\/]/).filter(Boolean);
+function shortLabels(list) {  // last folder name, plus parents only where two folders would look the same
+  return list.map((r, i) => {
+    const parts = segs(r);
+    for (let n = 1; n <= parts.length; n++) {
+      const name = parts.slice(-n).join('/');
+      if (!list.some((o, j) => j !== i && segs(o).slice(-n).join('/') === name)) return name;
+    }
+    return r;
+  });
+}
+function status(text, err) { $('#status').textContent = text; $('#status').classList.toggle('err', !!err); }
+function dot() { $('#dot').className = live ? 'dot live' : 'dot'; $('#dot').title = (live ? 'Live' : 'Disconnected, retrying') + (mode ? ' · ' + mode : ''); }
+function listUrl(after) {
+  const p = new URLSearchParams();
+  if (filter !== 'all') p.set('kind', filter);
+  if (rootFilter !== null) p.set('root', rootFilter);
+  if (query) p.set('q', query);
+  if (after) { p.set('before', after.at); p.set('before_m', after.mtime); p.set('before_id', after.id); }
+  return 'api/list?' + p;
+}
+async function load() {
+  const g = ++gen;
+  let d; try { d = await (await fetch(listUrl())).json(); } catch { return; }
+  if (g !== gen) return;
+  if (rootFilter !== null && rootsText(d.roots) !== rootsText(roots)) { rootFilter = null; return load(); }
+  roots = d.roots; recent = d.recent || []; indexing = d.indexing; labels = shortLabels(roots); mode = d.mode;
+  baseTitle = 'Live Gallery · ' + labels.join(', '); if (!unseen) document.title = baseTitle;
+  waiting.clear(); status(indexing ? 'indexing…' : ''); $('#status').title = ''; dot(); renderChips();
+  clearGrid();
+  total = d.total; more = d.more;
+  for (const it of d.items) { const c = makeCard(it, null); cards.set(it.id, { it, el: c }); grid.append(c); }
+  counts(); if (!$('#watch').value) showRecent(); fillViewport();
+}
+async function loadMore() {
+  if (!more || loadingMore || !grid.lastElementChild) return;
+  loadingMore = true; const g = gen;
+  try {
+    const d = await (await fetch(listUrl(cards.get(grid.lastElementChild.dataset.id).it))).json();
+    if (g !== gen) return;
+    for (const it of d.items) if (!cards.has(it.id)) { const c = makeCard(it, null); cards.set(it.id, { it, el: c }); grid.append(c); }
+    total = d.total; more = d.more; counts();
+  } catch { } finally { loadingMore = false; }
+  fillViewport();
+}
+const nearBottom = () => $('#more').getBoundingClientRect().top < innerHeight + 900;
+let fillRaf = 0;
+function fillViewport() { if (!fillRaf) fillRaf = requestAnimationFrame(() => { fillRaf = 0; if (more && nearBottom()) loadMore(); }); }
+addEventListener('scroll', () => { fillViewport(); if (waiting.size && scrollY < 200) reloadMarking(new Map(waiting)); }, { passive: true });
+addEventListener('resize', fillViewport);
+$('#status').onclick = () => { if (waiting.size) scrollTo({ top: 0 }); };
+function connect() {
+  const es = new EventSource('events'); let broke = false;
+  es.onopen = () => { live = true; dot(); if (broke) load(); broke = false; };
+  es.onerror = () => { live = false; dot(); broke = true; };
+  es.onmessage = e => {
+    const ev = JSON.parse(e.data);
+    if (ev.type === 'reset') { inbox = []; held = []; pauseLabel(); closeLb(); load(); return; }  // the watched folders changed
+    if (paused && ev.type !== 'remove') { held.push(ev); pauseLabel(); } else enqueue(ev);
+  };
+}
+
+// ---------- choosing folders: chips (click = show only that folder, × = stop watching), box adds ----------
+function renderChips() {
+  const box = $('#roots'); box.replaceChildren();
+  roots.forEach((r, i) => {
+    const chip = el('span', 'chip' + (rootFilter === i ? ' on' : ''));
+    const nm = el('button', 'nm', labels[i]); nm.type = 'button';
+    nm.title = r + (roots.length > 1 ? (rootFilter === i ? '\nClick to show all folders' : '\nClick to show only this folder') : '');
+    nm.onclick = () => { if (roots.length < 2) return; rootFilter = rootFilter === i ? null : i; renderChips(); load(); };
+    chip.append(nm);
+    if (roots.length > 1) {
+      const x = el('button', 'x', '×'); x.type = 'button'; x.title = 'Stop watching ' + r;
+      x.onclick = () => setRoots(roots.filter((_, j) => j !== i));
+      chip.append(x);
+    }
+    box.append(chip);
+  });
+}
+async function setRoots(list) {
+  if (!list.length) return status('enter a folder path', true);
+  status('switching…');
+  const r = await fetch('api/watch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ roots: list }) });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) { status(d.error || 'failed', true); return false; }
+  const u = new URL(location.href); u.searchParams.set('watch', rootsText(d.roots)); history.replaceState(null, '', u);
+  return true;
+}
+const splitPaths = v => v.split(',').map(s => s.trim()).filter(Boolean);
+const watch = v => setRoots(splitPaths(v));                      // replace all watched folders
+const addFolders = v => setRoots([...roots, ...splitPaths(v)]);  // add to them
+function fillList(values) { $('#dl').replaceChildren(...values.map(v => Object.assign(document.createElement('option'), { value: v }))); }
+function showRecent() { const seen = new Set(roots); fillList(recent.flat().filter(p => !seen.has(p) && seen.add(p))); }
+let acTimer;
+$('#watch').oninput = e => {
+  clearTimeout(acTimer);
+  const v = e.target.value, i = v.lastIndexOf(','), head = i < 0 ? '' : v.slice(0, i + 1) + ' ', last = v.slice(i + 1).trim();
+  if (!last) return showRecent();
+  acTimer = setTimeout(async () => {
+    const d = await (await fetch('api/dirs?prefix=' + encodeURIComponent(last))).json();
+    if ($('#watch').value === v) fillList(d.dirs.map(p => head + p));
+  }, 120);
+};
+$('#watch').onkeydown = e => { if (e.key === 'Escape') { e.target.value = ''; e.target.blur(); showRecent(); } };
+$('#wf').onsubmit = async e => {
+  e.preventDefault(); const v = $('#watch').value;
+  if (!splitPaths(v).length) return status('type a folder path to add', true);
+  if (await addFolders(v)) { $('#watch').value = ''; $('#watch').blur(); }
+};
+
+// ---------- controls ----------
+function setQuery(v) { v = v.trim().toLowerCase(); if (v === query) return; query = v; load(); }
+$('#seg').onclick = e => { const b = e.target.closest('button'); if (!b || filter === b.dataset.f) return; filter = b.dataset.f; for (const x of $('#seg').children) x.classList.toggle('on', x === b); load(); };
+let qTimer;
+$('#q').oninput = e => { clearTimeout(qTimer); qTimer = setTimeout(() => setQuery(e.target.value), 160); };
+function setSize(v) { grid.style.setProperty('--size', v + 'px'); try { localStorage.setItem('lg-size', v); } catch {} fillViewport(); }
+try { const v = localStorage.getItem('lg-size'); if (v) { $('#size').value = v; setSize(v); } } catch {}
+$('#size').oninput = e => setSize(e.target.value);
+$('#follow').onclick = () => { follow = !follow; $('#follow').classList.toggle('on', follow); };
+function pauseLabel() { $('#pause').textContent = paused ? (held.length ? `Resume (${held.length} new)` : 'Resume') : 'Pause'; $('#pause').classList.toggle('on', paused); }
+$('#pause').onclick = () => { paused = !paused; if (!paused) { const h = held; held = []; h.forEach(enqueue); } pauseLabel(); };
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { unseen = 0; document.title = baseTitle; } });
+setInterval(() => { for (const a of document.querySelectorAll('.ago')) a.textContent = ago(+a.dataset.t); }, 15000);
+
+// ---------- thumbnails ----------
+// 3D thumbnails are made once, then kept by the server on disk, so nothing is redone on the next visit.
+function saveThumb(it, blob) {
+  fetch('api/thumb?id=' + encodeURIComponent(it.id) + '&v=' + it.mtime, { method: 'POST', headers: { 'Content-Type': blob.type || 'image/png' }, body: blob }).catch(() => {});
+}
+// 3D: rendered in a worker when the card scrolls into view, one at a time, new arrivals first.
+const thumbQ = []; let busy = false;
+const thumbObserver = new IntersectionObserver(es => {
+  for (const e of es) if (e.isIntersecting) { thumbObserver.unobserve(e.target); e.target._front ? thumbQ.unshift(e.target) : thumbQ.push(e.target); pump(); }
+}, { rootMargin: '300px' });
+function queueModel(th, front) { th.classList.add('pending'); th._front = front; thumbObserver.observe(th); }
+async function pump() {
+  if (busy) return; busy = true;
+  while (thumbQ.length) {
+    const th = thumbQ.shift(); if (!th.isConnected) continue; const it = th._it;
+    const box = th.getBoundingClientRect();
+    if (box.bottom < -400 || box.top > innerHeight + 400) { thumbObserver.observe(th); continue; }  // scrolled away: do it when it comes back
+    try {
+      const blob = await renderModel(it);
+      saveThumb(it, blob);
+      if (!th.isConnected) continue;
+      th._blob = URL.createObjectURL(blob);
+      const img = new Image(); img.alt = it.name;
+      img.onload = () => { th.classList.remove('pending'); th.replaceChildren(img); requestAnimationFrame(() => img.classList.add('ready')); };
+      img.src = th._blob;
+    } catch (e) {
+      console.warn('thumbnail failed', it.rel, e);
+      th.classList.remove('pending'); const s = th.querySelector('small'); if (s) s.textContent = 'no preview';
+    }
+  }
+  busy = false;
+}
+let worker = null, job = null, pageKit = null, useWorker = typeof OffscreenCanvas !== 'undefined' && typeof Worker !== 'undefined';
+async function renderModel(it) {
+  if (useWorker) {
+    try { return await viaWorker(it); }
+    catch (e) { if (useWorker && !e.dom) throw e; }  // a bad or unfinished model: don't parse it again on the page
+  }  // no worker support, or a loader that needs the page (textured FBX/OBJ): render here instead
+  if (!pageKit) pageKit = await thumbKit(document.createElement('canvas'), THUMB);
+  await drawThumb(pageKit, src(it), it.ext);
+  return await new Promise((ok, no) => pageKit.r.domElement.toBlob(b => b ? ok(b) : no(new Error('toBlob failed')), 'image/webp', 0.9));
+}
+function endJob(err, blob) { const j = job; job = null; if (!j) return; clearTimeout(j.timer); err ? j.no(err) : j.ok(blob); }
+function killWorker(err) { worker?.terminate(); worker = null; endJob(err); }
+function viaWorker(it) {
+  return new Promise((ok, no) => {
+    if (!worker) {
+      worker = new Worker('worker.js', { type: 'module' });
+      worker.onmessage = e => { if (e.data.fatal) { useWorker = false; killWorker(new Error(e.data.error)); } else endJob(e.data.error && Object.assign(new Error(e.data.error), { dom: e.data.dom }), e.data.blob); };
+      worker.onerror = e => { useWorker = false; killWorker(new Error(e.message || 'worker failed to start')); };
+    }
+    job = { ok, no, timer: setTimeout(() => killWorker(new Error('timed out')), 180000) };
+    worker.postMessage({ url: new URL(src(it), location.href).href, ext: it.ext, size: THUMB });
+  });
+}
+
+// ---------- lightbox ----------
+let lbId = null, viewer = null;
+const visibleIds = () => [...grid.children].map(e => e.dataset.id);
+function closeViewer() { if (viewer) { viewer.close(); viewer = null; } }
+function closeLb() { closeViewer(); zoom = null; lbId = null; $('#lb').classList.remove('open'); $('#lbStage').replaceChildren(); }
+async function openLb(id) {
+  const c = cards.get(id); if (!c) return; const it = c.it;
+  const keep = lbId === id && zoom ? { ...zoom } : null; zoom = null; $('#lbZoom').textContent = ''; lbId = id;
+  c.el.querySelector('.tag')?.remove();
+  closeViewer(); const st = $('#lbStage'); st.replaceChildren();
+  $('#lbName').textContent = it.name; $('#lbPath').textContent = it.abs; $('#lbPath').title = it.abs;
+  $('#lbInfo').textContent = `${fmtSize(it.size)} · ${new Date(it.mtime * 1000).toLocaleTimeString()}`;
+  $('#lb').classList.add('open');
+  if (it.kind === 'image') {
+    const img = new Image(); img.draggable = false; img.alt = it.name;
+    img.onload = () => { if (lbId === id && img.isConnected) zoomInit(img, keep); };
+    img.onerror = () => { if (img.isConnected) st.replaceChildren(el('div', 'lbmsg', 'Could not load image')); };
+    img.src = src(it); st.append(img); return;
+  }
+  const small = c.el.querySelector('.thumb img.ready');  // the thumbnail stands in while the model loads
+  if (small) { const bg = new Image(); bg.className = 'lbthumb'; bg.alt = ''; bg.src = small.src; st.append(bg); }
+  const msg = el('div', 'lbmsg', 'Loading model…'); st.append(msg);
+  let obj, THREE, OrbitControls;
+  try {
+    obj = await loadModel(src(it), it.ext, p => { if (lbId === id && p.total) msg.textContent = `Loading model… ${Math.round(p.loaded / p.total * 100)}% of ${fmtSize(p.total)}`; });
+    ({ THREE } = await three()); OrbitControls = await orbit();
+  } catch (e) { if (lbId === id) msg.textContent = 'Could not load model: ' + (e.message || e); return; }
+  if (lbId !== id || viewer) { dispose(obj); return; }
+  st.replaceChildren(); viewer = makeViewer(st, obj, THREE, OrbitControls);
+}
+function makeViewer(st, obj, THREE, OrbitControls) {
+  const r = new THREE.WebGLRenderer({ antialias: true, alpha: true }); r.setPixelRatio(Math.min(devicePixelRatio, 2));
+  st.append(r.domElement);
+  const scene = stage(r); scene.add(obj);
+  const cam = new THREE.PerspectiveCamera(35, 1, .01, 1000), ctl = new OrbitControls(cam, r.domElement); ctl.enableDamping = true;
+  frame(cam, obj, ctl);
+  let dirty = true, raf;  // draw only when the view changes, not 60 times a second
+  ctl.addEventListener('change', () => { dirty = true; });
+  const fit = () => { const w = st.clientWidth || 1, h = st.clientHeight || 1; r.setSize(w, h, false); cam.aspect = w / h; cam.updateProjectionMatrix(); dirty = true; };
+  const ro = new ResizeObserver(fit); ro.observe(st); fit();
+  const loop = () => { raf = requestAnimationFrame(loop); ctl.update(); if (dirty) { dirty = false; r.render(scene, cam); } }; loop();
+  return { close() { cancelAnimationFrame(raf); ro.disconnect(); ctl.dispose(); dispose(obj); scene.environment?.dispose(); r.dispose(); r.forceContextLoss(); r.domElement.remove(); } };
+}
+async function step(d) {
+  let ids = visibleIds(), i = ids.indexOf(lbId); if (i < 0) return;
+  if (d > 0 && i === ids.length - 1 && more) { await loadMore(); ids = visibleIds(); i = ids.indexOf(lbId); }
+  const n = ids[i + d]; if (n) openLb(n);
+}
+$('#lbPrev').onclick = () => step(-1); $('#lbNext').onclick = () => step(1); $('#lbClose').onclick = closeLb;
+// ---------- image zoom: click image = 100% / fit, wheel = zoom at cursor, drag = pan ----------
+// Clicking the backdrop (or a 3D model without dragging) closes the viewer.
+let zoom = null, downAt = null, drag = null;
+const stg = $('#lbStage'), near = (a, b) => Math.abs(a - b) < 1e-3;
+const fitScale = z => Math.min(stg.clientWidth / z.w, stg.clientHeight / z.h) || 1;
+function zoomApply() {
+  const z = zoom; if (!z) return;
+  const W = stg.clientWidth, H = stg.clientHeight, sw = z.w * z.s, sh = z.h * z.s;
+  z.x = sw <= W ? (W - sw) / 2 : Math.min(0, Math.max(W - sw, z.x));
+  z.y = sh <= H ? (H - sh) / 2 : Math.min(0, Math.max(H - sh, z.y));
+  z.img.style.transform = `translate(${z.x}px,${z.y}px) scale(${z.s})`;
+  z.img.style.imageRendering = z.s >= 2 ? 'pixelated' : 'auto';
+  z.img.style.cursor = drag?.moved ? 'grabbing' : near(z.s, z.fit) ? 'zoom-in' : 'grab';
+  $('#lbZoom').textContent = Math.round(z.s * 100) + '%';
+}
+function zoomInit(img, keep) {
+  const z = { img, w: img.naturalWidth || 1024, h: img.naturalHeight || 1024, x: 0, y: 0 };
+  img.style.width = z.w + 'px'; img.style.height = z.h + 'px';
+  z.fit = fitScale(z); z.s = z.fit;
+  if (keep && keep.w === z.w && keep.h === z.h && !near(keep.s, keep.fit)) Object.assign(z, { s: keep.s, x: keep.x, y: keep.y });
+  zoom = z; zoomApply(); img.style.opacity = 1;
+}
+function zoomTo(s, cx, cy) {  // keeps the image point under (cx, cy) in place
+  const z = zoom; if (!z) return;
+  s = Math.min(Math.max(z.fit, 1) * 16, Math.max(z.fit, s));
+  const r = s / z.s; z.x = cx - (cx - z.x) * r; z.y = cy - (cy - z.y) * r; z.s = s; zoomApply();
+}
+function zoomToggle(cx = stg.clientWidth / 2, cy = stg.clientHeight / 2) {
+  if (!zoom) return;
+  if (near(zoom.s, zoom.fit)) zoomTo(zoom.fit < 1 ? 1 : zoom.fit * 2, cx, cy); else { zoom.s = zoom.fit; zoomApply(); }
+}
+new ResizeObserver(() => { if (!zoom) return; const was = near(zoom.s, zoom.fit); zoom.fit = fitScale(zoom); if (was) zoom.s = zoom.fit; zoomApply(); }).observe(stg);
+const local = e => { const r = stg.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+stg.addEventListener('wheel', e => { if (!zoom) return; e.preventDefault(); zoomTo(zoom.s * Math.exp(-e.deltaY * 0.0015), ...local(e)); }, { passive: false });
+stg.addEventListener('pointerdown', e => {
+  downAt = [e.clientX, e.clientY];
+  if (zoom && e.target === zoom.img && e.button === 0) { e.preventDefault(); zoom.img.setPointerCapture(e.pointerId); drag = { x: e.clientX, y: e.clientY, ox: zoom.x, oy: zoom.y, moved: false }; }
+});
+stg.addEventListener('pointermove', e => {
+  if (!drag || !zoom) return;
+  drag.moved ||= Math.hypot(e.clientX - drag.x, e.clientY - drag.y) > 6;
+  zoom.x = drag.ox + e.clientX - drag.x; zoom.y = drag.oy + e.clientY - drag.y; zoomApply();
+});
+const endDrag = () => { if (drag) { drag = null; zoomApply(); } };
+stg.addEventListener('pointerup', endDrag); stg.addEventListener('pointercancel', endDrag);
+stg.addEventListener('click', e => {
+  if (downAt && Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 6) return;  // that was a drag
+  if (zoom && e.target === zoom.img) return zoomToggle(...local(e));
+  closeLb();
+});
+$('#lbZoom').onclick = () => zoomToggle();
+$('#lbWatch').onclick = () => { const it = cards.get(lbId)?.it; if (it) watch(it.absdir); };
+$('#lbCopy').onclick = async () => { try { await navigator.clipboard.writeText($('#lbPath').textContent); $('#lbCopy').textContent = 'Copied'; setTimeout(() => $('#lbCopy').textContent = 'Copy path', 1200); } catch {} };
+document.addEventListener('keydown', e => {
+  if (lbId) { if (zoom && e.key === '1') zoomTo(1, stg.clientWidth / 2, stg.clientHeight / 2); else if (zoom && e.key === '0') { zoom.s = zoom.fit; zoomApply(); } else if (e.key === 'Escape') closeLb(); else if (e.key === 'ArrowLeft') step(-1); else if (e.key === 'ArrowRight') step(1); return; }
+  const typing = e.target.closest?.('input, textarea, select, [contenteditable]');
+  if (e.key === '/' && !typing && !e.ctrlKey && !e.metaKey && !e.altKey) { e.preventDefault(); $('#q').focus(); }
+});
+
+(async () => {
+  // ?watch=/some/path (comma-separate several) makes a bookmarkable link to a folder
+  const want = new URL(location.href).searchParams.get('watch');
+  await load();
+  if (want && want !== rootsText(roots)) await watch(want);
+  connect();
+})();
+</script></body></html>
