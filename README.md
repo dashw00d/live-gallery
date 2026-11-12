@@ -75,3 +75,14 @@ live-gallery [DIR ...] [--port N] [--default DIR] [-x NAME] [--poll] [-i SECS] [
 - 3D thumbnails are cached in `~/.cache/live-gallery/thumbs` (small WebP files; the oldest are pruned
   automatically, and deleting the folder is always safe).
 - 3D previews need internet the first time (three.js comes from jsDelivr). Images work offline.
+
+## Rust version
+
+A Rust port with the same flags, page and behavior is in `src/` (one ~3.5 MB binary, no Python needed).
+It uses the same `state.json` and thumbnail cache, so you can switch between the two freely. The Python
+script remains the reference implementation for now.
+
+```bash
+cargo build --release
+./target/release/live-gallery ~/path/to/folder --open
+```

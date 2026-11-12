@@ -1,4 +1,4 @@
-//! Server-sent events. OWNED BY: integrator. Change only by agreement (see PORTING.md).
+//! Server-sent events.
 use crate::item::{Item, Kind};
 use serde::Serialize;
 
