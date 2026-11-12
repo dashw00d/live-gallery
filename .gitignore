@@ -2,3 +2,4 @@ lantern.yaml
 __pycache__/
 *.pyc
 *.bak
+/target
