@@ -104,7 +104,8 @@ pub fn kind_of(name: &str) -> Option<(Kind, String)> {
 pub fn make_item(roots: &[String], key: &Key, info: &FileInfo, at: Option<f64>) -> Item {
     let (root, rel) = key;
     let (dir, name) = rel.rsplit_once('/').unwrap_or(("", rel));
-    let full = std::path::Path::new(&roots[*root]).join(rel);
+    let mut full = std::path::PathBuf::from(&roots[*root]);
+    full.extend(rel.split('/'));
     let abs = full.to_string_lossy().into_owned();
     let absdir = full.parent().unwrap().to_string_lossy().into_owned();
     let hash = format!("{}\0{}\0{}", abs, float_repr(info.mtime), info.size);

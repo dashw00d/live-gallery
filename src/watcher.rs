@@ -3,12 +3,13 @@
 //! requests never wait for a walk of a big tree.
 use crate::events::{Event, Hub};
 use crate::item::{FileInfo, Item, Key, SKIP_DIRS, float_repr, kind_of, make_item};
+#[cfg(target_os = "linux")]
 use crate::util::SETTLE;
 #[cfg(target_os = "linux")]
 use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -21,13 +22,14 @@ use std::{
 pub struct WatcherOpts {
     pub interval: f64,
     pub exclude: Vec<String>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "always polls"))]
     pub poll: bool,
 }
 
 #[cfg(target_os = "linux")]
 struct Ino {
     ino: Inotify,
-    wds: HashMap<WatchDescriptor, (usize, PathBuf)>,
+    wds: HashMap<WatchDescriptor, (usize, std::path::PathBuf)>,
     warned: bool,
 }
 
@@ -59,6 +61,7 @@ fn info(path: &Path, name: &str) -> Option<FileInfo> {
     Some(FileInfo { size: md.len(), mtime, kind, ext })
 }
 
+#[cfg(target_os = "linux")]
 fn same(a: &FileInfo, size: u64, mtime: f64) -> bool {
     a.size == size && a.mtime == mtime
 }
@@ -200,6 +203,7 @@ impl Watcher {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn sync(&self, cur: HashMap<Key, FileInfo>) {
         let gone: Vec<Key> = {
             let items = self.items.lock().unwrap();

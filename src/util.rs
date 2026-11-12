@@ -1,16 +1,20 @@
 //! Paths, folder completion, thumbnail cache helpers.
 use std::path::{Component, Path, PathBuf};
-pub const SETTLE: f64 = 1.0;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "only the inotify watcher holds files back"))]
+pub const SETTLE: f64 = 1.0; // seconds a file found mid-copy must stay unchanged before it is shown
 pub const THUMB_MAX: usize = 3 << 20;
 fn home() -> PathBuf {
+    // Python's expanduser: HOME, else USERPROFILE on Windows.
     std::env::var_os("HOME")
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|s| !s.is_empty()))
         .map(PathBuf::from)
         .unwrap_or_default()
 }
 fn expand(p: &str) -> PathBuf {
     if p == "~" {
         home()
-    } else if let Some(rest) = p.strip_prefix("~/") {
+    } else if let Some(rest) = p.strip_prefix("~/").or_else(|| p.strip_prefix("~\\").filter(|_| cfg!(windows))) {
         home().join(rest)
     } else {
         PathBuf::from(p)
@@ -87,6 +91,14 @@ fn absolute(p: &Path) -> PathBuf {
     }
     out
 }
+/// Is `a` inside `b`? Windows paths are case-insensitive (Python's normcase).
+fn inside(a: &str, b: &str) -> bool {
+    if cfg!(windows) {
+        Path::new(&a.to_lowercase()).starts_with(b.to_lowercase())
+    } else {
+        Path::new(a).starts_with(b)
+    }
+}
 pub fn norm_roots(paths: &[String]) -> (Vec<String>, Vec<String>) {
     let (mut roots, mut bad) = (Vec::new(), Vec::new());
     for p in paths {
@@ -109,7 +121,7 @@ pub fn norm_roots(paths: &[String]) -> (Vec<String>, Vec<String>) {
         .filter(|r| {
             !roots
                 .iter()
-                .any(|o| *r != o && Path::new(r.as_str()).starts_with(o))
+                .any(|o| *r != o && inside(r, o))
         })
         .cloned()
         .collect();
@@ -122,11 +134,15 @@ pub fn complete_dirs(prefix: &str, limit: usize) -> Vec<String> {
         return vec![];
     }
     let expanded = p.to_string_lossy();
-    let (base, part) = if raw.ends_with('/') {
+    let is_sep = |c: char| c == '/' || (cfg!(windows) && c == '\\');
+    let (base, part) = if raw.ends_with(is_sep) {
         (p.as_path(), "")
     } else {
-        let (base, part) = expanded.rsplit_once('/').unwrap_or(("", ""));
-        (Path::new(if base.is_empty() { "/" } else { base }), part)
+        let i = expanded.rfind(is_sep).unwrap_or(0);
+        let (base, part) = (&expanded[..i], expanded.get(i + 1..).unwrap_or(""));
+        // keep the root of "/x" or "C:\x" as the base
+        let base = if base.is_empty() || base.ends_with(':') { &expanded[..=i] } else { base };
+        (Path::new(base), part)
     };
     let Ok(entries) = std::fs::read_dir(base) else {
         return vec![];
@@ -140,7 +156,7 @@ pub fn complete_dirs(prefix: &str, limit: usize) -> Vec<String> {
             && (!name.starts_with('.') || part.starts_with('.'))
             && e.path().is_dir()
         {
-            out.push(format!("{}/", e.path().display()));
+            out.push(format!("{}{}", e.path().display(), std::path::MAIN_SEPARATOR));
             if out.len() >= limit {
                 break;
             }

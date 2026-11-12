@@ -86,3 +86,6 @@ script remains the reference implementation for now.
 cargo build --release
 ./target/release/live-gallery ~/path/to/folder --open
 ```
+
+It builds natively on Linux, macOS and Windows. To make a Windows `.exe` from Linux, install mingw-w64 and run
+`rustup target add x86_64-pc-windows-gnu && cargo build --release --target x86_64-pc-windows-gnu`.
