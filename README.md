@@ -23,6 +23,10 @@ Then open http://localhost:8765 (`--open` does it for you). You can change the f
 
 ## What you get
 
+- **Newest first, fast.** The page loads the newest 60 files and fetches older ones as you scroll, so a
+  folder with thousands of files opens instantly.
+- **Thumbnails made once.** 3D thumbnails render in a background worker (the page never freezes on a big
+  model) and are saved on disk, so the next visit shows them immediately without loading the models again.
 - **Live grid.** New files get a green **NEW** badge. Re-saved files jump back to the top marked **UPDATED**,
   and deleted files disappear. Files show up once they've finished writing, never half-saved.
 - **Several folders at once.** Each watched folder is a chip at the top. Click a chip to show only that
@@ -48,7 +52,7 @@ live-gallery [DIR ...] [--port N] [--default DIR] [-x NAME] [--poll] [-i SECS] [
 | `DIR ...` | Folders to watch. Without it you get the last folder you picked in the page, else `--default`, else the current folder. |
 | `-x NAME` | Skip folders with this name (repeatable). `.git`, `node_modules`, venvs, caches, `vendor`, `target`, `.godot`, `.import` and similar are already skipped. |
 | `--poll`, `-i SECS` | Check for changes every SECS seconds (default 1) instead of using inotify. |
-| `-n N` | How many existing files to show at start (default 150, newest first). |
+| `-n N` | Files per page: the newest N load first, older ones as you scroll (default 60). |
 | `--port N` | Port (default 8765, or the next free one). |
 
 ## How it watches
@@ -65,4 +69,6 @@ live-gallery [DIR ...] [--port N] [--default DIR] [-x NAME] [--poll] [-i SECS] [
 
 - Only serves image/3D files from inside the folders you're watching, and only listens on `127.0.0.1` by default.
 - Your chosen folder and recent folders are saved in `~/.config/live-gallery/state.json`.
+- Thumbnails are cached in `~/.cache/live-gallery/thumbs` (small WebP files; the oldest are pruned
+  automatically, and deleting the folder is always safe).
 - 3D previews need internet the first time (three.js comes from jsDelivr). Images work offline.

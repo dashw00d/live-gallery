@@ -5,10 +5,14 @@ browser the moment they appear, newest first, no matter how deeply nested.
     live-gallery [DIR ...] [--port 8765] [--initial 150] [-x DIRNAME] [--poll] [--open]
 
 Standard library only. Uses Linux inotify (instant, idle when nothing changes); falls back
-to polling every --interval seconds elsewhere or with --poll. 3D previews load three.js from a CDN inside the browser.
+to polling every --interval seconds elsewhere or with --poll.
+
+The page loads the newest files first and older ones on scroll. Thumbnails (3D ones are
+rendered in a browser worker) are cached under ~/.cache/live-gallery/thumbs. 3D previews load three.js from a CDN inside the browser.
 """
 import argparse
 import errno
+import hashlib
 import json
 import mimetypes
 import os
@@ -151,10 +155,11 @@ class Watcher:
         size, mtime, kind, ext = info
         d, _, name = rel.rpartition("/")
         full = os.path.join(self.roots[ri], *rel.split("/"))
+        tkey = hashlib.sha1(f"{full}\0{mtime!r}\0{size}".encode("utf-8", "surrogateescape")).hexdigest()
         return {"id": f"{ri}/{rel}", "rel": rel, "dir": d, "name": name, "kind": kind,
                 "ext": ext[1:], "size": size, "mtime": mtime,
                 "root": ri, "abs": full, "absdir": os.path.dirname(full),
-                "url": f"/f/{ri}/" + urllib.parse.quote(rel)}
+                "url": f"f/{ri}/" + urllib.parse.quote(rel), "tkey": tkey, "thumb": False}
 
     def broadcast(self, ev):
         if not self.stopped and self.hub:
@@ -181,7 +186,8 @@ class Watcher:
         with self.lock:
             item = self.items.pop(key, None)
         if item:
-            self.broadcast({"type": "remove", "id": item["id"]})
+            self.broadcast({"type": "remove", "id": item["id"], "kind": item["kind"],
+                            "rel": item["rel"], "root": item["root"]})
 
     def sync(self, cur):
         for k, v in cur.items():
@@ -297,6 +303,40 @@ STATE_PATH = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduse
                           "live-gallery", "state.json")
 
 
+THUMB_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+                         "live-gallery", "thumbs")
+THUMB_MAX = 3 << 20
+
+
+def image_type(head):
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    if head[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    return None
+
+
+def thumb_file(tkey):
+    return os.path.join(THUMB_DIR, tkey)
+
+
+def prune_thumbs(keep=6000, limit=9000):
+    """Thumbnails are keyed by path+mtime+size, so old versions pile up; drop the oldest."""
+    try:
+        with os.scandir(THUMB_DIR) as it:
+            files = [(e.stat().st_mtime, e.path) for e in it if e.is_file()]
+    except OSError:
+        return
+    if len(files) > limit:
+        for _, path in sorted(files)[:len(files) - keep]:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
 def norm_roots(paths):
     roots, bad = [], []
     for p in paths:
@@ -401,46 +441,111 @@ class App:
 
         threading.Thread(target=run, daemon=True).start()
 
-    def listing(self):
+    def listing(self, q):
+        """Newest first. `before`/`before_id` continue from the last item of the previous page."""
         with self.lock:
             w, indexing = self.w, self.indexing
         with w.lock:
-            items = sorted(w.items.values(), key=lambda i: i["mtime"], reverse=True)[:self.initial]
-            total = len(w.items)
-        return {"roots": w.roots, "total": total, "items": items, "indexing": indexing,
-                "mode": w.mode(), "recent": self.state.get("recent", [])}
+            items = list(w.items.values())
+        everything = len(items)
+        kind, text = q.get("kind"), (q.get("q") or "").lower()
+        try:
+            root = int(q["root"]) if "root" in q else None
+            limit = max(1, min(500, int(q.get("limit") or self.initial)))
+            before = (float(q["before"]), q.get("before_id", "")) if "before" in q else None
+        except ValueError:
+            root, limit, before = None, self.initial, None
+        if kind or text or root is not None:
+            items = [i for i in items if (not kind or i["kind"] == kind) and (root is None or i["root"] == root)
+                     and (not text or text in i["rel"].lower())]
+        total = len(items)
+        order = lambda i: (i["mtime"], i["id"])
+        if before:
+            items = [i for i in items if order(i) < before]
+        items.sort(key=order, reverse=True)
+        page = [dict(i, thumb=os.path.exists(thumb_file(i["tkey"]))) for i in items[:limit]]
+        return {"roots": w.roots, "total": total, "all": everything, "items": page, "more": len(items) > limit,
+                "indexing": indexing, "mode": w.mode(), "recent": self.state.get("recent", [])}
+
+    def save_thumb(self, item_id, version, body):
+        ri, _, rel = item_id.partition("/")
+        try:
+            key, version = (int(ri), rel), float(version)
+        except ValueError:
+            return False
+        w = self.w
+        with w.lock:
+            item = w.items.get(key)
+        if not item or item["mtime"] != version:  # the file changed since this thumbnail was made
+            return False
+        try:
+            os.makedirs(THUMB_DIR, exist_ok=True)
+            tmp = thumb_file(item["tkey"]) + f".{threading.get_ident()}.tmp"
+            with open(tmp, "wb") as f:
+                f.write(body)
+            os.replace(tmp, thumb_file(item["tkey"]))
+        except OSError as ex:
+            print("could not save thumbnail:", ex, file=sys.stderr)
+            return False
+        return True
+
+
+IMMUTABLE = "private, max-age=31536000, immutable"
 
 
 def make_handler(app):
     class H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"  # keep-alive: a page of thumbnails reuses its connections
+        timeout = 300
+
         def log_message(self, *a):
             pass
 
         def do_GET(self):
             u = urllib.parse.urlsplit(self.path)
             path = u.path
+            q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
             if path == "/":
                 return self.send_bytes(PAGE.encode(), "text/html; charset=utf-8")
+            if path == "/kit.js":
+                return self.send_bytes(KIT_JS.encode(), "text/javascript; charset=utf-8")
+            if path == "/worker.js":
+                return self.send_bytes(WORKER_JS.encode(), "text/javascript; charset=utf-8")
             if path == "/api/list":
-                return self.send_json(app.listing())
+                return self.send_json(app.listing(q))
             if path == "/api/dirs":
-                prefix = urllib.parse.parse_qs(u.query).get("prefix", [""])[0]
-                return self.send_json({"dirs": complete_dirs(prefix)})
+                return self.send_json({"dirs": complete_dirs(q.get("prefix", ""))})
             if path == "/events":
                 return self.events()
             if path.startswith("/f/"):
-                return self.file(path[3:])
+                return self.file(path[3:], versioned="v" in q)
+            if path.startswith("/t/"):
+                return self.thumb(path[3:])
             self.send_error(404)
 
         def do_POST(self):
-            if urllib.parse.urlsplit(self.path).path != "/api/watch":
-                return self.send_error(404)
-            # JSON-only, so other websites can't trigger this with a plain form post
-            if not self.headers.get("Content-Type", "").startswith("application/json"):
-                return self.send_json({"error": "expected JSON"}, 415)
+            u = urllib.parse.urlsplit(self.path)
+            ctype = self.headers.get("Content-Type", "")
             try:
                 n = int(self.headers.get("Content-Length") or 0)
-                paths = json.loads(self.rfile.read(n) or b"{}").get("roots")
+            except ValueError:
+                n = -1
+            if not 0 <= n <= THUMB_MAX:
+                return self.send_error(413)  # also closes the connection, so the body is never read
+            body = self.rfile.read(n)
+            if u.path == "/api/thumb":
+                # image/* is not a "simple" content type, so other websites can't post here
+                q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+                if not ctype.startswith("image/") or not image_type(body[:16]):
+                    return self.send_json({"error": "expected an image"}, 415)
+                return self.send_json({"ok": app.save_thumb(q.get("id", ""), q.get("v", ""), body)})
+            if u.path != "/api/watch":
+                return self.send_error(404)
+            # JSON-only, so other websites can't trigger this with a plain form post
+            if not ctype.startswith("application/json"):
+                return self.send_json({"error": "expected JSON"}, 415)
+            try:
+                paths = json.loads(body or b"{}").get("roots")
                 if isinstance(paths, str):
                     paths = [paths]
                 if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
@@ -458,15 +563,25 @@ def make_handler(app):
         def send_json(self, obj, status=200):
             return self.send_bytes(json.dumps(obj).encode(), "application/json", status)
 
-        def send_bytes(self, body, ctype, status=200):
+        def send_bytes(self, body, ctype, status=200, cache="no-store"):
             self.send_response(status)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
+            self.send_header("Cache-Control", cache)
             self.end_headers()
             self.wfile.write(body)
 
-        def file(self, rest):
+        def thumb(self, tkey):
+            if len(tkey) != 40 or any(c not in "0123456789abcdef" for c in tkey):
+                return self.send_error(404)
+            try:
+                with open(thumb_file(tkey), "rb") as f:
+                    body = f.read()
+            except OSError:
+                return self.send_error(404)
+            self.send_bytes(body, image_type(body[:16]) or "application/octet-stream", cache=IMMUTABLE)
+
+        def file(self, rest, versioned=False):
             w = app.w
             ri, _, rel = rest.partition("/")
             try:
@@ -493,18 +608,20 @@ def make_handler(app):
                 self.send_response(200)
                 self.send_header("Content-Type", mimetypes.guess_type(full)[0] or "application/octet-stream")
                 self.send_header("Content-Length", str(os.fstat(f.fileno()).st_size))
-                self.send_header("Cache-Control", "no-cache")
+                # ?v=<mtime> URLs never change content, so the browser can keep them
+                self.send_header("Cache-Control", IMMUTABLE if versioned else "no-cache")
                 self.end_headers()
                 try:
                     while chunk := f.read(1 << 20):
                         self.wfile.write(chunk)
                 except (BrokenPipeError, ConnectionResetError):
-                    pass
+                    self.close_connection = True
 
         def events(self):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")  # an endless stream has no length
             self.end_headers()
             q = queue.Queue()
             with app.lock:
@@ -527,10 +644,99 @@ def make_handler(app):
     return H
 
 
+KIT_JS = r"""// 3D helpers shared by the page and the thumbnail worker.
+// three.js comes from the CDN on first use, so images work offline. The "+esm" builds
+// need no import map, which is what lets the same code run inside a worker.
+const CDN = 'https://cdn.jsdelivr.net/npm/three@0.160.0/';
+const X = p => CDN + 'examples/jsm/' + p + '/+esm';
+let T;
+export async function three() {
+  if (T) return T;
+  const [THREE, { GLTFLoader }, { DRACOLoader }, { MeshoptDecoder }, { OBJLoader }, { STLLoader }, { PLYLoader }, { FBXLoader }, { RoomEnvironment }] = await Promise.all([
+    import(CDN + '+esm'), import(X('loaders/GLTFLoader.js')), import(X('loaders/DRACOLoader.js')),
+    import(X('libs/meshopt_decoder.module.js')), import(X('loaders/OBJLoader.js')), import(X('loaders/STLLoader.js')),
+    import(X('loaders/PLYLoader.js')), import(X('loaders/FBXLoader.js')), import(X('environments/RoomEnvironment.js'))]);
+  const draco = new DRACOLoader(); draco.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.6/');
+  const gltf = new GLTFLoader(); gltf.setDRACOLoader(draco); gltf.setMeshoptDecoder(MeshoptDecoder);
+  T = { THREE, RoomEnvironment, L: { gltf, glb: gltf, obj: new OBJLoader(), stl: new STLLoader(), ply: new PLYLoader(), fbx: new FBXLoader() } };
+  return T;
+}
+export async function orbit() { return (await import(X('controls/OrbitControls.js'))).OrbitControls; }
+
+export async function loadModel(url, ext, onProgress) {
+  const obj = await readModel(url, ext, onProgress);
+  // Tone the room light down so pale, untextured models keep their surface detail instead of clipping to white.
+  obj.traverse(o => { for (const m of [].concat(o.material || [])) if ('envMapIntensity' in m) m.envMapIntensity = 0.45; });
+  return obj;
+}
+async function readModel(url, ext, onProgress) {
+  const { THREE, L } = await three();
+  if (ext === 'glb' || ext === 'gltf') return (await L.gltf.loadAsync(url, onProgress)).scene;
+  if (ext === 'obj' || ext === 'fbx') return await L[ext].loadAsync(url, onProgress);
+  const geo = await L[ext].loadAsync(url, onProgress), colored = !!geo.attributes.color;
+  if (ext === 'ply' && !geo.index) {  // point cloud
+    geo.computeBoundingSphere();
+    return new THREE.Points(geo, new THREE.PointsMaterial({ size: geo.boundingSphere.radius / 200, vertexColors: colored, color: colored ? 0xffffff : 0xb8c0cc }));
+  }
+  if (!geo.attributes.normal) geo.computeVertexNormals();
+  return new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: colored ? 0xffffff : 0xb8c0cc, vertexColors: colored, roughness: .55, metalness: .1 }));
+}
+export function stage(renderer) {
+  const { THREE, RoomEnvironment } = T, scene = new THREE.Scene(), pm = new THREE.PMREMGenerator(renderer);
+  scene.environment = pm.fromScene(new RoomEnvironment(), 0.04).texture; pm.dispose();
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 0.15));
+  const d = new THREE.DirectionalLight(0xffffff, 1.6); d.position.set(3, 5, 4); scene.add(d);
+  return scene;
+}
+export function frame(cam, obj, ctl) {
+  const { THREE } = T, box = new THREE.Box3().setFromObject(obj); if (box.isEmpty()) return;
+  const c = box.getCenter(new THREE.Vector3()), r = box.getSize(new THREE.Vector3()).length() / 2 || 1;
+  const dist = r / Math.sin(THREE.MathUtils.degToRad(cam.fov / 2));
+  cam.position.copy(c).addScaledVector(new THREE.Vector3(1, .7, 1.2).normalize(), dist * 1.02);
+  cam.near = dist / 100; cam.far = dist * 100; cam.updateProjectionMatrix(); cam.lookAt(c);
+  if (ctl) { ctl.target.copy(c); ctl.update(); }
+}
+export function dispose(obj) {
+  obj.traverse(o => {
+    o.geometry?.dispose();
+    for (const m of [].concat(o.material || [])) { for (const k in m) if (m[k]?.isTexture) m[k].dispose(); m.dispose(); }
+  });
+}
+
+// Thumbnails: one renderer reused for every model. `canvas` is a <canvas> or an OffscreenCanvas.
+export async function thumbKit(canvas, size) {
+  const { THREE } = await three();
+  const r = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true, preserveDrawingBuffer: true });
+  r.setSize(size, size, false);
+  return { r, scene: stage(r), cam: new THREE.PerspectiveCamera(35, 1, .01, 1000) };
+}
+export async function drawThumb(kit, url, ext) {
+  const obj = await loadModel(url, ext);
+  try { kit.scene.add(obj); frame(kit.cam, obj); kit.r.render(kit.scene, kit.cam); }
+  finally { kit.scene.remove(obj); dispose(obj); }
+}
+"""
+
+WORKER_JS = r"""// Renders 3D thumbnails off the page's main thread, so parsing a big model never freezes the page.
+import { thumbKit, drawThumb } from './kit.js';
+let kit = null;
+self.onmessage = async e => {
+  const { url, ext, size } = e.data;
+  if (!kit) {
+    try { kit = await thumbKit(new OffscreenCanvas(size, size), size); }
+    catch (err) { postMessage({ error: String(err?.message || err), fatal: true }); return; }
+  }
+  try {
+    await drawThumb(kit, url, ext);
+    postMessage({ blob: await kit.r.domElement.convertToBlob({ type: 'image/webp', quality: 0.9 }) });
+  } catch (err) { postMessage({ error: String(err?.message || err) }); }
+};
+"""
+
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Live Gallery</title>
-<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%231c2029'/%3E%3Ccircle cx='8' cy='8' r='3.5' fill='%234ade80'/%3E%3C/svg%3E">
 <style>
 :root{--bg:#0f1115;--panel:#171a21;--card:#1c2029;--line:#2a2f3a;--text:#e6e8ec;--muted:#8b93a3;--accent:#6aa9ff;--new:#4ade80;--upd:#fbbf24;--c1:#242833;--c2:#1c2029;color-scheme:dark}
 @media (prefers-color-scheme:light){:root{--bg:#f3f4f7;--panel:#fff;--card:#fff;--line:#e2e5ea;--text:#1b1f27;--muted:#667085;--accent:#2563eb;--new:#16a34a;--upd:#d97706;--c1:#eceef2;--c2:#fff;color-scheme:light}}
@@ -547,18 +753,24 @@ h1{font-size:15px;margin:0;display:flex;align-items:center;gap:8px;white-space:n
 #wf{display:flex;gap:6px;flex:1 1 220px;min-width:0}
 #watch{flex:1;min-width:0;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:5px 10px;font:12px ui-monospace,monospace}
 #watch:focus,input[type=search]:focus{outline:2px solid var(--accent);outline-offset:-1px}
-#status{color:var(--muted);font-size:12px;white-space:nowrap}#status.err{color:#ef4444}
+#status{color:var(--muted);font-size:12px;white-space:nowrap}#status.err{color:#ef4444}#status:empty{display:none}
 button,input{font:inherit;color:var(--text)}
 button{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:5px 10px;cursor:pointer}
+button:hover{border-color:var(--muted)}
 button.on{background:var(--accent);border-color:var(--accent);color:#fff}
 .seg{display:flex}.seg button{border-radius:0;margin-left:-1px}.seg button:first-child{border-radius:8px 0 0 8px}.seg button:last-child{border-radius:0 8px 8px 0}
 input[type=search]{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:5px 10px;width:210px;max-width:100%}
-#count{color:var(--muted);font-size:12px;white-space:nowrap}
+#count{color:var(--muted);font-size:12px;white-space:nowrap;font-variant-numeric:tabular-nums}
 #grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--size,200px),1fr));gap:12px;padding:16px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden;cursor:pointer;position:relative;transition:box-shadow .6s,border-color .6s}
-.card.fresh{border-color:var(--new);box-shadow:0 0 0 2px var(--new)}.card.fresh.upd{border-color:var(--upd);box-shadow:0 0 0 2px var(--upd)}
+.card:hover{border-color:var(--muted)}
+.card.fresh{border-color:var(--new);box-shadow:0 0 0 2px var(--new);animation:pop .22s ease-out}.card.fresh.upd{border-color:var(--upd);box-shadow:0 0 0 2px var(--upd)}
+@keyframes pop{from{opacity:0;transform:scale(.96)}}
 .thumb{aspect-ratio:1;display:grid;place-items:center;background:repeating-conic-gradient(var(--c1) 0 25%,var(--c2) 0 50%) 0 0/16px 16px;overflow:hidden}
-.thumb img{width:100%;height:100%;object-fit:contain;display:block}
+.thumb img{width:100%;height:100%;object-fit:contain;display:block;opacity:0;transition:opacity .18s}.thumb img.ready{opacity:1}
+.thumb.model{background:radial-gradient(circle at 50% 38%,#3b4252,#1b1f27)}.thumb.model .ph{color:#aab2c0}
+.thumb.pending .ph{animation:pulse 1.5s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.45}}
 .ph{color:var(--muted);font-weight:700;font-size:20px;text-align:center}.ph small{display:block;font-size:11px;font-weight:400}
 .meta{padding:7px 10px 9px}
 .name{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -570,13 +782,15 @@ input[type=search]{background:var(--card);border:1px solid var(--line);border-ra
 .tag{right:7px;background:var(--new);color:#04130a}.tag.upd{background:var(--upd)}
 .hidden{display:none!important}
 #empty{color:var(--muted);text-align:center;padding:80px 16px}
+#more{color:var(--muted);text-align:center;font-size:12px;padding:4px 16px 40px;min-height:1px}
 #lb{position:fixed;inset:0;z-index:10;background:rgba(8,9,12,.94);display:none;flex-direction:column}
 #lb.open{display:flex}
 #lbStage{flex:1;min-height:0;position:relative;overflow:hidden;touch-action:none}
 #lbStage canvas{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:grab}
 #lbStage img{position:absolute;left:0;top:0;transform-origin:0 0;max-width:none;user-select:none;-webkit-user-drag:none;opacity:0}
+#lbStage img.lbthumb{inset:0;width:100%;height:100%;object-fit:contain;opacity:.3;pointer-events:none}
 #lbZoom{color:#9aa3b2;font-size:12px;cursor:pointer;min-width:3.5em;text-align:right;font-variant-numeric:tabular-nums}
-.lbmsg{position:absolute;inset:0;display:grid;place-items:center;color:#aab}
+.lbmsg{position:absolute;inset:0;display:grid;place-items:center;color:#cdd3de;font-variant-numeric:tabular-nums;pointer-events:none}
 #lbBar{display:flex;gap:8px;align-items:center;padding:10px 16px;color:#eee;background:#14161c;border-top:1px solid #2a2f3a}
 #lbBar button{background:#1c2029;border-color:#2a2f3a;color:#eee}
 .lbtext{flex:1;min-width:0}
@@ -584,6 +798,7 @@ input[type=search]{background:var(--card);border:1px solid var(--line);border-ra
 #lbPath{font:12px ui-monospace,monospace;color:#9aa3b2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #lbInfo{color:#9aa3b2;font-size:12px;white-space:nowrap}
 @media (max-width:640px){#lbInfo{display:none}#size{display:none}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style></head><body>
 <header>
   <h1><span class="dot" id="dot"></span>Live Gallery</h1>
@@ -599,6 +814,7 @@ input[type=search]{background:var(--card);border:1px solid var(--line);border-ra
 </header>
 <main id="grid"></main>
 <div id="empty">Waiting for images or 3D files…</div>
+<div id="more"></div>
 <div id="lb">
   <div id="lbStage"></div>
   <div id="lbBar">
@@ -608,9 +824,14 @@ input[type=search]{background:var(--card);border:1px solid var(--line);border-ra
   </div>
 </div>
 <script type="module">
+import { three, orbit, loadModel, stage, frame, dispose, thumbKit, drawThumb } from './kit.js';
+
 const $ = s => document.querySelector(s);
-const grid = $('#grid'), cards = new Map();
-let filter = 'all', query = '', paused = false, follow = false, held = [], unseen = 0;
+const grid = $('#grid'), cards = new Map();  // id -> { it, el }; the grid holds the newest files, older ones load on scroll
+const THUMB = 512, KEEP = 300, TRIM_AT = 420;
+let filter = 'all', query = '', rootFilter = null, paused = false, follow = false, held = [], unseen = 0;
+let roots = [], recent = [], labels = [], indexing = false, total = 0, more = false, gen = 0, loadingMore = false;
+let baseTitle = 'Live Gallery', live = false, mode = '';
 
 const src = it => it.url + '?v=' + it.mtime;
 const fmtSize = b => b < 1024 ? b + ' B' : b < 1048576 ? (b / 1024).toFixed(0) + ' KB' : (b / 1048576).toFixed(1) + ' MB';
@@ -621,13 +842,28 @@ function ago(t) {
   return new Date(t * 1000).toLocaleDateString();
 }
 function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+// The server applies these filters to what it sends; this is the same test for live arrivals.
 const matches = it => (filter === 'all' || it.kind === filter) && (rootFilter === null || it.root === rootFilter) && (!query || it.rel.toLowerCase().includes(query));
+const filtered = () => filter !== 'all' || rootFilter !== null || !!query;
 
+// ---------- cards ----------
+function placeholder(it, note) { const p = el('div', 'ph', it.ext.toUpperCase()); p.append(el('small', null, note)); return p; }
 function makeCard(it, fresh) {
   const c = el('div', 'card'); c.dataset.id = it.id;
-  const th = el('div', 'thumb');
-  if (it.kind === 'image') { const img = new Image(); img.loading = 'lazy'; img.decoding = 'async'; img.alt = it.name; img.src = src(it); th.append(img); }
-  else { th.append(el('div', 'ph', it.ext.toUpperCase())); th._it = it; thumbObserver.observe(th); }
+  const th = el('div', it.kind === 'model' ? 'thumb model' : 'thumb'); th._it = it;
+  const cached = it.thumb ? 't/' + it.tkey : null;
+  if (it.kind === 'image') {
+    const img = new Image(); img.loading = 'lazy'; img.decoding = 'async'; img.alt = it.name;
+    let full = !cached;  // showing the original file rather than a small thumbnail
+    img.onload = () => { img.classList.add('ready'); if (full && shrinkable(it, img)) { full = false; shrinkQ.push({ it, th, img }); pumpShrink(); } };
+    img.onerror = () => { if (!full && !th._blob) { full = true; img.src = src(it); } else th.replaceChildren(placeholder(it, 'can’t display')); };
+    img.src = cached || src(it); th.append(img);
+  } else if (cached) {
+    const img = new Image(); img.loading = 'lazy'; img.decoding = 'async'; img.alt = it.name;
+    img.onload = () => img.classList.add('ready');
+    img.onerror = () => { th.replaceChildren(placeholder(it, fmtSize(it.size))); queueModel(th, false); };
+    img.src = cached; th.append(img);
+  } else { th.append(placeholder(it, fmtSize(it.size))); queueModel(th, !!fresh); }
   c.append(th, el('span', 'badge', it.ext));
   const meta = el('div', 'meta');
   meta.append(el('div', 'name', it.name));
@@ -643,32 +879,48 @@ function makeCard(it, fresh) {
     setTimeout(() => c.classList.remove('fresh'), 20000);
   }
   c.onclick = () => openLb(it.id);
-  c.classList.toggle('hidden', !matches(it));
   return c;
 }
+function revoke(th) { if (th?._blob) { URL.revokeObjectURL(th._blob); th._blob = null; } }
+function dropCard(id) { const c = cards.get(id); if (!c) return; revoke(c.el.firstChild); c.el.remove(); cards.delete(id); }
+function clearGrid() { for (const c of cards.values()) revoke(c.el.firstChild); grid.replaceChildren(); cards.clear(); thumbQ.length = 0; shrinkQ.length = 0; }
 
-function apply(ev) {
-  if (ev.type === 'remove') {
-    const c = cards.get(ev.id); if (c) { c.el.remove(); cards.delete(ev.id); }
-  } else {
-    const it = ev.item, old = cards.get(it.id);
-    if (old) old.el.remove();
+// ---------- live events: applied once per frame, so a burst of 200 files is one update ----------
+let inbox = [], flushRaf = 0;
+function enqueue(ev) {
+  inbox.push(ev);
+  if (document.hidden) flush();  // frames don't run in a background tab
+  else if (!flushRaf) flushRaf = requestAnimationFrame(flush);
+}
+function flush() {
+  cancelAnimationFrame(flushRaf); flushRaf = 0;
+  const evs = inbox; inbox = []; let open = null;
+  for (const ev of evs) {
+    if (ev.type === 'remove') {
+      if (cards.has(ev.id) || matches(ev)) total = Math.max(0, total - 1);
+      dropCard(ev.id); continue;
+    }
+    const it = ev.item; if (!matches(it)) continue;
+    if (cards.has(it.id)) dropCard(it.id); else if (ev.type === 'add') total++;
     const c = makeCard(it, ev.type); cards.set(it.id, { it, el: c }); grid.prepend(c);
-    if (document.hidden) { unseen++; document.title = `(${unseen}) Live Gallery`; }
-    if (lbId === it.id || (follow && matches(it))) openLb(it.id);
+    if (document.hidden) unseen++;
+    if (lbId === it.id || follow) open = it.id;
   }
+  if (unseen) document.title = `(${unseen}) ${baseTitle}`;
+  // Don't let a long session pile up thousands of cards; older ones come back when you scroll down.
+  if (cards.size > TRIM_AT && scrollY < innerHeight) { while (cards.size > KEEP) dropCard(grid.lastElementChild.dataset.id); more = true; }
   counts();
+  if (open && cards.has(open)) openLb(open);
 }
 function counts() {
-  let v = 0; for (const { el } of cards.values()) if (!el.classList.contains('hidden')) v++;
-  $('#count').textContent = v === cards.size ? `${v} files` : `${v} of ${cards.size}`;
-  $('#empty').classList.toggle('hidden', v > 0);
-  $('#empty').textContent = cards.size ? 'Nothing matches the filter.' : 'Waiting for images or 3D files…';
+  const n = cards.size;
+  $('#count').textContent = total > n ? `${n} of ${total}` : `${n} file${n === 1 ? '' : 's'}`;
+  $('#empty').classList.toggle('hidden', n > 0);
+  $('#empty').textContent = indexing ? 'Indexing ' + labels.join(', ') + ' …' : filtered() ? 'Nothing matches the filter.' : 'Waiting for images or 3D files…';
+  $('#more').textContent = more ? 'Loading older files…' : n > 40 ? 'That’s everything.' : '';
 }
-function refilter() { for (const { it, el } of cards.values()) el.classList.toggle('hidden', !matches(it)); counts(); }
-function setQuery(v) { query = v.trim().toLowerCase(); refilter(); }
 
-let roots = [], recent = [], labels = [], indexing = false, rootFilter = null;
+// ---------- loading: newest page first, older pages as you scroll ----------
 const rootsText = r => r.join(', ');
 const segs = p => p.split(/[\\/]/).filter(Boolean);
 function shortLabels(list) {  // last folder name, plus parents only where two folders would look the same
@@ -682,28 +934,51 @@ function shortLabels(list) {  // last folder name, plus parents only where two f
   });
 }
 function status(text, err) { $('#status').textContent = text; $('#status').classList.toggle('err', !!err); }
-async function load() {
-  const d = await (await fetch('/api/list')).json();
-  if (rootsText(d.roots) !== rootsText(roots)) rootFilter = null;
-  roots = d.roots; recent = d.recent || []; indexing = d.indexing; labels = shortLabels(roots);
-  document.title = 'Live Gallery · ' + labels.join(', ');
-  status(indexing ? 'indexing…' : (d.total > d.items.length ? `newest ${d.items.length} of ${d.total}` : d.mode));
-  $('#status').title = d.mode;
-  renderChips();
-  grid.replaceChildren(); cards.clear(); held = []; pauseLabel();
-  for (const it of d.items) { const c = makeCard(it, null); cards.set(it.id, { it, el: c }); grid.append(c); }
-  counts();
-  if (indexing) $('#empty').textContent = 'Indexing ' + labels.join(', ') + ' …';
-  if (!$('#watch').value) showRecent();
+function dot() { $('#dot').className = live ? 'dot live' : 'dot'; $('#dot').title = (live ? 'Live' : 'Disconnected, retrying') + (mode ? ' · ' + mode : ''); }
+function listUrl(after) {
+  const p = new URLSearchParams();
+  if (filter !== 'all') p.set('kind', filter);
+  if (rootFilter !== null) p.set('root', rootFilter);
+  if (query) p.set('q', query);
+  if (after) { p.set('before', after.mtime); p.set('before_id', after.id); }
+  return 'api/list?' + p;
 }
+async function load() {
+  const g = ++gen;
+  let d; try { d = await (await fetch(listUrl())).json(); } catch { return; }
+  if (g !== gen) return;
+  if (rootFilter !== null && rootsText(d.roots) !== rootsText(roots)) { rootFilter = null; return load(); }
+  roots = d.roots; recent = d.recent || []; indexing = d.indexing; labels = shortLabels(roots); mode = d.mode;
+  baseTitle = 'Live Gallery · ' + labels.join(', '); if (!unseen) document.title = baseTitle;
+  status(indexing ? 'indexing…' : ''); dot(); renderChips();
+  clearGrid(); inbox = []; held = []; pauseLabel();
+  total = d.total; more = d.more;
+  for (const it of d.items) { const c = makeCard(it, null); cards.set(it.id, { it, el: c }); grid.append(c); }
+  counts(); if (!$('#watch').value) showRecent(); fillViewport();
+}
+async function loadMore() {
+  if (!more || loadingMore || !grid.lastElementChild) return;
+  loadingMore = true; const g = gen;
+  try {
+    const d = await (await fetch(listUrl(cards.get(grid.lastElementChild.dataset.id).it))).json();
+    if (g !== gen) return;
+    for (const it of d.items) if (!cards.has(it.id)) { const c = makeCard(it, null); cards.set(it.id, { it, el: c }); grid.append(c); }
+    total = d.total; more = d.more; counts();
+  } catch { } finally { loadingMore = false; }
+  fillViewport();
+}
+const nearBottom = () => $('#more').getBoundingClientRect().top < innerHeight + 900;
+let fillRaf = 0;
+function fillViewport() { if (!fillRaf) fillRaf = requestAnimationFrame(() => { fillRaf = 0; if (more && nearBottom()) loadMore(); }); }
+addEventListener('scroll', fillViewport, { passive: true }); addEventListener('resize', fillViewport);
 function connect() {
-  const es = new EventSource('/events'); let broke = false;
-  es.onopen = () => { $('#dot').className = 'dot live'; $('#dot').title = 'live'; if (broke) load(); broke = false; };
-  es.onerror = () => { $('#dot').className = 'dot'; $('#dot').title = 'disconnected, retrying'; broke = true; };
+  const es = new EventSource('events'); let broke = false;
+  es.onopen = () => { live = true; dot(); if (broke) load(); broke = false; };
+  es.onerror = () => { live = false; dot(); broke = true; };
   es.onmessage = e => {
     const ev = JSON.parse(e.data);
     if (ev.type === 'reset') { closeLb(); load(); return; }
-    if (paused && ev.type !== 'remove') { held.push(ev); pauseLabel(); } else apply(ev);
+    if (paused && ev.type !== 'remove') { held.push(ev); pauseLabel(); } else enqueue(ev);
   };
 }
 
@@ -714,7 +989,7 @@ function renderChips() {
     const chip = el('span', 'chip' + (rootFilter === i ? ' on' : ''));
     const nm = el('button', 'nm', labels[i]); nm.type = 'button';
     nm.title = r + (roots.length > 1 ? (rootFilter === i ? '\nClick to show all folders' : '\nClick to show only this folder') : '');
-    nm.onclick = () => { if (roots.length < 2) return; rootFilter = rootFilter === i ? null : i; renderChips(); refilter(); };
+    nm.onclick = () => { if (roots.length < 2) return; rootFilter = rootFilter === i ? null : i; renderChips(); load(); };
     chip.append(nm);
     if (roots.length > 1) {
       const x = el('button', 'x', '×'); x.type = 'button'; x.title = 'Stop watching ' + r;
@@ -727,7 +1002,7 @@ function renderChips() {
 async function setRoots(list) {
   if (!list.length) return status('enter a folder path', true);
   status('switching…');
-  const r = await fetch('/api/watch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ roots: list }) });
+  const r = await fetch('api/watch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ roots: list }) });
   const d = await r.json().catch(() => ({}));
   if (!r.ok) { status(d.error || 'failed', true); return false; }
   const u = new URL(location.href); u.searchParams.set('watch', rootsText(d.roots)); history.replaceState(null, '', u);
@@ -744,7 +1019,7 @@ $('#watch').oninput = e => {
   const v = e.target.value, i = v.lastIndexOf(','), head = i < 0 ? '' : v.slice(0, i + 1) + ' ', last = v.slice(i + 1).trim();
   if (!last) return showRecent();
   acTimer = setTimeout(async () => {
-    const d = await (await fetch('/api/dirs?prefix=' + encodeURIComponent(last))).json();
+    const d = await (await fetch('api/dirs?prefix=' + encodeURIComponent(last))).json();
     if ($('#watch').value === v) fillList(d.dirs.map(p => head + p));
   }, 120);
 };
@@ -756,87 +1031,96 @@ $('#wf').onsubmit = async e => {
 };
 
 // ---------- controls ----------
-$('#seg').onclick = e => { const b = e.target.closest('button'); if (!b) return; filter = b.dataset.f; for (const x of $('#seg').children) x.classList.toggle('on', x === b); refilter(); };
-$('#q').oninput = e => setQuery(e.target.value);
-function setSize(v) { grid.style.setProperty('--size', v + 'px'); try { localStorage.setItem('lg-size', v); } catch {} }
+function setQuery(v) { v = v.trim().toLowerCase(); if (v === query) return; query = v; load(); }
+$('#seg').onclick = e => { const b = e.target.closest('button'); if (!b || filter === b.dataset.f) return; filter = b.dataset.f; for (const x of $('#seg').children) x.classList.toggle('on', x === b); load(); };
+let qTimer;
+$('#q').oninput = e => { clearTimeout(qTimer); qTimer = setTimeout(() => setQuery(e.target.value), 160); };
+function setSize(v) { grid.style.setProperty('--size', v + 'px'); try { localStorage.setItem('lg-size', v); } catch {} fillViewport(); }
 try { const v = localStorage.getItem('lg-size'); if (v) { $('#size').value = v; setSize(v); } } catch {}
 $('#size').oninput = e => setSize(e.target.value);
 $('#follow').onclick = () => { follow = !follow; $('#follow').classList.toggle('on', follow); };
 function pauseLabel() { $('#pause').textContent = paused ? (held.length ? `Resume (${held.length} new)` : 'Resume') : 'Pause'; $('#pause').classList.toggle('on', paused); }
-$('#pause').onclick = () => { paused = !paused; if (!paused) { const h = held; held = []; h.forEach(apply); } pauseLabel(); };
-document.addEventListener('visibilitychange', () => { if (!document.hidden) { unseen = 0; document.title = 'Live Gallery'; } });
+$('#pause').onclick = () => { paused = !paused; if (!paused) { const h = held; held = []; h.forEach(enqueue); } pauseLabel(); };
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { unseen = 0; document.title = baseTitle; } });
 setInterval(() => { for (const a of document.querySelectorAll('.ago')) a.textContent = ago(+a.dataset.t); }, 15000);
 
-// ---------- three.js (loaded lazily, so images work even offline) ----------
-let T;
-async function three() {
-  if (T) return T;
-  const [THREE, { OrbitControls }, { GLTFLoader }, { DRACOLoader }, { MeshoptDecoder }, { OBJLoader }, { STLLoader }, { PLYLoader }, { FBXLoader }, { RoomEnvironment }] = await Promise.all([
-    import('three'), import('three/addons/controls/OrbitControls.js'), import('three/addons/loaders/GLTFLoader.js'),
-    import('three/addons/loaders/DRACOLoader.js'), import('three/addons/libs/meshopt_decoder.module.js'),
-    import('three/addons/loaders/OBJLoader.js'), import('three/addons/loaders/STLLoader.js'),
-    import('three/addons/loaders/PLYLoader.js'), import('three/addons/loaders/FBXLoader.js'),
-    import('three/addons/environments/RoomEnvironment.js')]);
-  const draco = new DRACOLoader(); draco.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.6/');
-  const gltf = new GLTFLoader(); gltf.setDRACOLoader(draco); gltf.setMeshoptDecoder(MeshoptDecoder);
-  T = { THREE, OrbitControls, RoomEnvironment, L: { gltf, glb: gltf, obj: new OBJLoader(), stl: new STLLoader(), ply: new PLYLoader(), fbx: new FBXLoader() } };
-  return T;
+// ---------- thumbnails ----------
+// Made once, then kept by the server on disk, so nothing is redone on the next visit.
+function saveThumb(it, blob) {
+  fetch('api/thumb?id=' + encodeURIComponent(it.id) + '&v=' + it.mtime, { method: 'POST', headers: { 'Content-Type': blob.type || 'image/png' }, body: blob }).catch(() => {});
 }
-async function loadModel(it) {
-  const { THREE, L } = await three(); const url = src(it), x = it.ext;
-  if (x === 'glb' || x === 'gltf') return (await L.gltf.loadAsync(url)).scene;
-  if (x === 'obj' || x === 'fbx') return await L[x].loadAsync(url);
-  const geo = await L[x].loadAsync(url); const colored = !!geo.attributes.color;
-  if (x === 'ply' && !geo.index) {           // point cloud
-    geo.computeBoundingSphere();
-    return new THREE.Points(geo, new THREE.PointsMaterial({ size: geo.boundingSphere.radius / 200, vertexColors: colored, color: colored ? 0xffffff : 0xb8c0cc }));
+const idle = () => new Promise(r => (window.requestIdleCallback || setTimeout)(r, { timeout: 500 }));
+
+// Images: the original shows first; big ones are then swapped for a small copy to free memory.
+const shrinkable = (it, img) => !/^(svg|gif|ico)$/.test(it.ext) && (it.size > 120000 || Math.max(img.naturalWidth, img.naturalHeight) > 1024);
+const shrinkQ = []; let shrinking = false;
+async function pumpShrink() {
+  if (shrinking) return; shrinking = true;
+  while (shrinkQ.length) {
+    const { it, th, img } = shrinkQ.shift(); if (!img.isConnected) continue;
+    await idle();
+    try {
+      const k = Math.min(1, THUMB / Math.max(img.naturalWidth, img.naturalHeight)), c = document.createElement('canvas');
+      c.width = Math.max(1, Math.round(img.naturalWidth * k)); c.height = Math.max(1, Math.round(img.naturalHeight * k));
+      const g = c.getContext('2d'); g.imageSmoothingQuality = 'high'; g.drawImage(img, 0, 0, c.width, c.height);
+      const blob = await new Promise(r => c.toBlob(r, 'image/webp', 0.86));
+      if (!blob) continue;
+      saveThumb(it, blob);
+      if (img.isConnected) { th._blob = URL.createObjectURL(blob); img.src = th._blob; }
+    } catch (e) { console.warn('thumbnail failed', it.rel, e); }
   }
-  if (!geo.attributes.normal) geo.computeVertexNormals();
-  return new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: colored ? 0xffffff : 0xb8c0cc, vertexColors: colored, roughness: .55, metalness: .1 }));
-}
-function stage(renderer) {
-  const { THREE, RoomEnvironment } = T, scene = new THREE.Scene(), pm = new THREE.PMREMGenerator(renderer);
-  scene.environment = pm.fromScene(new RoomEnvironment(), 0.04).texture; pm.dispose();
-  scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 0.6));
-  const d = new THREE.DirectionalLight(0xffffff, 1.2); d.position.set(3, 5, 4); scene.add(d);
-  return scene;
-}
-function frame(cam, obj, ctl) {
-  const { THREE } = T, box = new THREE.Box3().setFromObject(obj); if (box.isEmpty()) return;
-  const c = box.getCenter(new THREE.Vector3()), r = box.getSize(new THREE.Vector3()).length() / 2 || 1;
-  const dist = r / Math.sin(THREE.MathUtils.degToRad(cam.fov / 2));
-  cam.position.copy(c).addScaledVector(new THREE.Vector3(1, .7, 1.2).normalize(), dist * 1.02);
-  cam.near = dist / 100; cam.far = dist * 100; cam.updateProjectionMatrix(); cam.lookAt(c);
-  if (ctl) { ctl.target.copy(c); ctl.update(); }
-}
-function dispose(obj) {
-  obj.traverse(o => {
-    o.geometry?.dispose();
-    for (const m of [].concat(o.material || [])) { for (const k in m) if (m[k]?.isTexture) m[k].dispose(); m.dispose(); }
-  });
+  shrinking = false;
 }
 
-// 3D thumbnails: one shared offscreen renderer, rendered only when the card scrolls into view
-let TK; const thumbQ = []; let busy = false;
-const thumbObserver = new IntersectionObserver(es => { for (const e of es) if (e.isIntersecting) { thumbObserver.unobserve(e.target); thumbQ.push(e.target); pump(); } }, { rootMargin: '300px' });
+// 3D: rendered in a worker when the card scrolls into view, one at a time, new arrivals first.
+const thumbQ = []; let busy = false;
+const thumbObserver = new IntersectionObserver(es => {
+  for (const e of es) if (e.isIntersecting) { thumbObserver.unobserve(e.target); e.target._front ? thumbQ.unshift(e.target) : thumbQ.push(e.target); pump(); }
+}, { rootMargin: '300px' });
+function queueModel(th, front) { th.classList.add('pending'); th._front = front; thumbObserver.observe(th); }
 async function pump() {
   if (busy) return; busy = true;
   while (thumbQ.length) {
-    const th = thumbQ.shift(); if (!th.isConnected) continue;
+    const th = thumbQ.shift(); if (!th.isConnected) continue; const it = th._it;
     try {
-      await three();
-      if (!TK) { const r = new T.THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true }); r.setSize(384, 384, false); TK = { r, scene: stage(r), cam: new T.THREE.PerspectiveCamera(35, 1, .01, 1000) }; }
-      const obj = await loadModel(th._it); TK.scene.add(obj); frame(TK.cam, obj);
-      TK.r.render(TK.scene, TK.cam); const img = new Image(); img.src = TK.r.domElement.toDataURL('image/png');
-      TK.scene.remove(obj); dispose(obj); th.replaceChildren(img);
-    } catch (e) { console.warn('thumbnail failed', th._it?.rel, e); th.firstChild?.append(el('small', null, 'no preview')); }
+      const blob = await renderModel(it);
+      saveThumb(it, blob);
+      if (!th.isConnected) continue;
+      th._blob = URL.createObjectURL(blob);
+      const img = new Image(); img.alt = it.name;
+      img.onload = () => { th.classList.remove('pending'); th.replaceChildren(img); requestAnimationFrame(() => img.classList.add('ready')); };
+      img.src = th._blob;
+    } catch (e) {
+      console.warn('thumbnail failed', it.rel, e);
+      th.classList.remove('pending'); const s = th.querySelector('small'); if (s) s.textContent = 'no preview';
+    }
   }
   busy = false;
+}
+let worker = null, job = null, pageKit = null, useWorker = typeof OffscreenCanvas !== 'undefined' && typeof Worker !== 'undefined';
+async function renderModel(it) {
+  if (useWorker) { try { return await viaWorker(it); } catch (e) { console.warn('worker thumbnail failed, rendering on the page instead:', it.rel, e.message); } }
+  if (!pageKit) pageKit = await thumbKit(document.createElement('canvas'), THUMB);
+  await drawThumb(pageKit, src(it), it.ext);
+  return await new Promise((ok, no) => pageKit.r.domElement.toBlob(b => b ? ok(b) : no(new Error('toBlob failed')), 'image/webp', 0.9));
+}
+function endJob(err, blob) { const j = job; job = null; if (!j) return; clearTimeout(j.timer); err ? j.no(err) : j.ok(blob); }
+function killWorker(err) { worker?.terminate(); worker = null; endJob(err); }
+function viaWorker(it) {
+  return new Promise((ok, no) => {
+    if (!worker) {
+      worker = new Worker('worker.js', { type: 'module' });
+      worker.onmessage = e => { if (e.data.fatal) { useWorker = false; killWorker(new Error(e.data.error)); } else endJob(e.data.error && new Error(e.data.error), e.data.blob); };
+      worker.onerror = e => { useWorker = false; killWorker(new Error(e.message || 'worker failed to start')); };
+    }
+    job = { ok, no, timer: setTimeout(() => killWorker(new Error('timed out')), 180000) };
+    worker.postMessage({ url: new URL(src(it), location.href).href, ext: it.ext, size: THUMB });
+  });
 }
 
 // ---------- lightbox ----------
 let lbId = null, viewer = null;
-const visibleIds = () => [...grid.children].filter(e => !e.classList.contains('hidden')).map(e => e.dataset.id);
+const visibleIds = () => [...grid.children].map(e => e.dataset.id);
 function closeViewer() { if (viewer) { viewer.close(); viewer = null; } }
 function closeLb() { closeViewer(); zoom = null; lbId = null; $('#lb').classList.remove('open'); $('#lbStage').replaceChildren(); }
 async function openLb(id) {
@@ -853,24 +1137,35 @@ async function openLb(id) {
     img.onerror = () => { if (img.isConnected) st.replaceChildren(el('div', 'lbmsg', 'Could not load image')); };
     img.src = src(it); st.append(img); return;
   }
+  const small = c.el.querySelector('.thumb img.ready');  // the thumbnail stands in while the model loads
+  if (small) { const bg = new Image(); bg.className = 'lbthumb'; bg.alt = ''; bg.src = small.src; st.append(bg); }
   const msg = el('div', 'lbmsg', 'Loading model…'); st.append(msg);
-  let obj; try { obj = await loadModel(it); } catch (e) { msg.textContent = 'Could not load model: ' + (e.message || e); return; }
+  let obj, THREE, OrbitControls;
+  try {
+    obj = await loadModel(src(it), it.ext, p => { if (lbId === id && p.total) msg.textContent = `Loading model… ${Math.round(p.loaded / p.total * 100)}% of ${fmtSize(p.total)}`; });
+    ({ THREE } = await three()); OrbitControls = await orbit();
+  } catch (e) { if (lbId === id) msg.textContent = 'Could not load model: ' + (e.message || e); return; }
   if (lbId !== id || viewer) { dispose(obj); return; }
-  msg.remove(); viewer = makeViewer(st, obj);
+  st.replaceChildren(); viewer = makeViewer(st, obj, THREE, OrbitControls);
 }
-function makeViewer(st, obj) {
-  const { THREE, OrbitControls } = T;
-  const r = new THREE.WebGLRenderer({ antialias: true, alpha: true }); r.setPixelRatio(devicePixelRatio);
+function makeViewer(st, obj, THREE, OrbitControls) {
+  const r = new THREE.WebGLRenderer({ antialias: true, alpha: true }); r.setPixelRatio(Math.min(devicePixelRatio, 2));
   st.append(r.domElement);
   const scene = stage(r); scene.add(obj);
   const cam = new THREE.PerspectiveCamera(35, 1, .01, 1000), ctl = new OrbitControls(cam, r.domElement); ctl.enableDamping = true;
   frame(cam, obj, ctl);
-  const fit = () => { const w = st.clientWidth || 1, h = st.clientHeight || 1; r.setSize(w, h, false); cam.aspect = w / h; cam.updateProjectionMatrix(); };
+  let dirty = true, raf;  // draw only when the view changes, not 60 times a second
+  ctl.addEventListener('change', () => { dirty = true; });
+  const fit = () => { const w = st.clientWidth || 1, h = st.clientHeight || 1; r.setSize(w, h, false); cam.aspect = w / h; cam.updateProjectionMatrix(); dirty = true; };
   const ro = new ResizeObserver(fit); ro.observe(st); fit();
-  let raf; const loop = () => { raf = requestAnimationFrame(loop); ctl.update(); r.render(scene, cam); }; loop();
+  const loop = () => { raf = requestAnimationFrame(loop); ctl.update(); if (dirty) { dirty = false; r.render(scene, cam); } }; loop();
   return { close() { cancelAnimationFrame(raf); ro.disconnect(); ctl.dispose(); dispose(obj); scene.environment?.dispose(); r.dispose(); r.forceContextLoss(); r.domElement.remove(); } };
 }
-function step(d) { const ids = visibleIds(), i = ids.indexOf(lbId); if (i < 0) return; const n = ids[i + d]; if (n) openLb(n); }
+async function step(d) {
+  let ids = visibleIds(), i = ids.indexOf(lbId); if (i < 0) return;
+  if (d > 0 && i === ids.length - 1 && more) { await loadMore(); ids = visibleIds(); i = ids.indexOf(lbId); }
+  const n = ids[i + d]; if (n) openLb(n);
+}
 $('#lbPrev').onclick = () => step(-1); $('#lbNext').onclick = () => step(1); $('#lbClose').onclick = closeLb;
 // ---------- image zoom: click image = 100% / fit, wheel = zoom at cursor, drag = pan ----------
 // Clicking the backdrop (or a 3D model without dragging) closes the viewer.
@@ -949,7 +1244,8 @@ def main():
     ap.add_argument("--default", help="folder to watch when no DIR is given and none was picked yet")
     ap.add_argument("-p", "--port", type=int, default=None, help="port (default 8765, or the next free one)")
     ap.add_argument("-i", "--interval", type=float, default=1.0, help="seconds between scans (default 1)")
-    ap.add_argument("-n", "--initial", type=int, default=150, help="existing files to show at start, newest first")
+    ap.add_argument("-n", "--initial", type=int, default=60,
+                    help="files per page: the newest N load first, older ones as you scroll (default 60)")
     ap.add_argument("-x", "--exclude", action="append", default=[], help="folder name to skip (repeatable)")
     ap.add_argument("--poll", action="store_true", help="poll instead of using inotify")
     ap.add_argument("--host", default="127.0.0.1")
@@ -966,6 +1262,7 @@ def main():
         if not roots:
             sys.exit(f"not a directory: {a.default}")
     app.set_roots(roots, save=False)  # indexes in the background; the page shows progress
+    threading.Thread(target=prune_thumbs, daemon=True).start()
 
     srv = None
     ports = [a.port] if a.port else range(8765, 8785)
