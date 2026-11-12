@@ -29,6 +29,9 @@ Then open http://localhost:8765 (`--open` does it for you). You can change the f
   model) and are saved on disk, so the next visit shows them immediately without loading the models again.
 - **Live grid.** New files get a green **NEW** badge. Re-saved files jump back to the top marked **UPDATED**,
   and deleted files disappear. Files show up once they've finished writing, never half-saved.
+- **Handles floods.** When a whole folder is copied or moved in, files appear once they've finished
+  copying, and the grid updates in one go with the newest on top. If you're scrolled down looking at
+  older files, it tells you how many arrived instead of moving the page.
 - **Several folders at once.** Each watched folder is a chip at the top. Click a chip to show only that
   folder, or click × to stop watching it. Use the **Add a folder…** box to add more: it autocompletes paths
   and suggests recent folders. Every card shows which folder it came from. Folders already inside a watched
@@ -69,6 +72,6 @@ live-gallery [DIR ...] [--port N] [--default DIR] [-x NAME] [--poll] [-i SECS] [
 
 - Only serves image/3D files from inside the folders you're watching, and only listens on `127.0.0.1` by default.
 - Your chosen folder and recent folders are saved in `~/.config/live-gallery/state.json`.
-- Thumbnails are cached in `~/.cache/live-gallery/thumbs` (small WebP files; the oldest are pruned
+- 3D thumbnails are cached in `~/.cache/live-gallery/thumbs` (small WebP files; the oldest are pruned
   automatically, and deleting the folder is always safe).
 - 3D previews need internet the first time (three.js comes from jsDelivr). Images work offline.

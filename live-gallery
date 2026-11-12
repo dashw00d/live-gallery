@@ -7,8 +7,9 @@ browser the moment they appear, newest first, no matter how deeply nested.
 Standard library only. Uses Linux inotify (instant, idle when nothing changes); falls back
 to polling every --interval seconds elsewhere or with --poll.
 
-The page loads the newest files first and older ones on scroll. Thumbnails (3D ones are
-rendered in a browser worker) are cached under ~/.cache/live-gallery/thumbs. 3D previews load three.js from a CDN inside the browser.
+The page loads the newest files first and older ones on scroll. 3D thumbnails are rendered
+in a browser worker and cached under ~/.cache/live-gallery/thumbs. A folder copied in whole is
+shown once its files have finished writing, as one update rather than a card per file. 3D previews load three.js from a CDN inside the browser.
 """
 import argparse
 import errno
@@ -72,9 +73,11 @@ class Inotify:
         os.close(self.fd)
 
     def events(self, stopped):
+        """Yields (wd, mask, name), or None about four times a second when nothing happened."""
         while not stopped():
             try:
-                if not select.select([self.fd], [], [], 1.0)[0]:
+                if not select.select([self.fd], [], [], 0.25)[0]:
+                    yield None
                     continue
                 buf = os.read(self.fd, 1 << 20)
             except InterruptedError:
@@ -98,6 +101,8 @@ class Watcher:
         self.stopped = False
         self.pending = {}  # polling mode: key -> (size, mtime) seen once, emitted when stable
         self.wds = {}      # inotify mode: wd -> (root_index, dir path)
+        self.young = {}    # inotify mode: key -> (info, due): found by a folder walk, maybe still being written
+        self.next_settle = 0
         self.warned = False
         self.ino = None
         if not poll:
@@ -150,7 +155,7 @@ class Watcher:
                   "add -x excludes, or raise fs.inotify.max_user_watches.", file=sys.stderr, flush=True)
 
     # ---- state changes ----
-    def make_item(self, key, info):
+    def make_item(self, key, info, at=None):
         ri, rel = key
         size, mtime, kind, ext = info
         d, _, name = rel.rpartition("/")
@@ -159,7 +164,8 @@ class Watcher:
         return {"id": f"{ri}/{rel}", "rel": rel, "dir": d, "name": name, "kind": kind,
                 "ext": ext[1:], "size": size, "mtime": mtime,
                 "root": ri, "abs": full, "absdir": os.path.dirname(full),
-                "url": f"f/{ri}/" + urllib.parse.quote(rel), "tkey": tkey, "thumb": False}
+                "url": f"f/{ri}/" + urllib.parse.quote(rel), "tkey": tkey, "thumb": False,
+                "at": mtime if at is None else at}
 
     def broadcast(self, ev):
         if not self.stopped and self.hub:
@@ -168,13 +174,13 @@ class Watcher:
     def stop(self):
         self.stopped = True  # loops notice within a second; the inotify fd is closed by its loop
 
-    def upsert(self, key, info):
+    def upsert(self, key, info, at=None):
         now = time.time()
         with self.lock:
             old = self.items.get(key)
             if old and (old["size"], old["mtime"]) == info[:2]:
                 return
-            item = self.make_item(key, info)
+            item = self.make_item(key, info, at or now)
             item["first"] = old["first"] if old else now
             self.items[key] = item
         # a file still settling within 5s of first appearing stays "new"
@@ -219,8 +225,13 @@ class Watcher:
 
     def _inotify_loop(self):
         I = Inotify
-        for wd, mask, name in self.ino.events(lambda: self.stopped):
+        for event in self.ino.events(lambda: self.stopped):
             try:
+                if self.young and time.time() >= self.next_settle:
+                    self.settle()
+                if event is None:
+                    continue
+                wd, mask, name = event
                 if mask & I.Q_OVERFLOW:
                     print("event queue overflowed; rescanning", file=sys.stderr, flush=True)
                     self.sync(self.scan_all())
@@ -237,8 +248,14 @@ class Watcher:
                     if name in self.skip:
                         continue
                     if mask & (I.CREATE | I.MOVED_TO):
+                        # A whole folder arrived (copied or moved in). Files changed in the last moments may
+                        # still be mid-copy: hold those until they finish instead of announcing them twice.
+                        at = time.time()
                         for k, v in self.walk(ri, path).items():
-                            self.upsert(k, v)
+                            if at - v[1] < SETTLE:
+                                self.young[k] = (v, at + SETTLE)
+                            else:
+                                self.upsert(k, v, at)
                     elif mask & I.MOVED_FROM:
                         self.drop_tree(path)
                     continue
@@ -251,11 +268,32 @@ class Watcher:
                         st = os.stat(path)
                     except OSError:
                         continue
+                    self.young.pop(key, None)
                     self.upsert(key, (st.st_size, st.st_mtime, kind, ext))
                 elif mask & (I.DELETE | I.MOVED_FROM):
+                    self.young.pop(key, None)
                     self.remove(key)
             except Exception as ex:  # keep watching no matter what
                 print("event error:", ex, file=sys.stderr, flush=True)
+
+    def settle(self):
+        """Announce held files once their size and time have stopped changing."""
+        now = time.time()
+        self.next_settle = now + 0.2
+        for key, (info, due) in list(self.young.items()):
+            if now < due:
+                continue
+            try:
+                st = os.stat(os.path.join(self.roots[key[0]], *key[1].split("/")))
+            except OSError:
+                del self.young[key]
+                continue
+            cur = (st.st_size, st.st_mtime) + info[2:]
+            if cur[:2] == info[:2]:
+                del self.young[key]
+                self.upsert(key, cur)
+            else:
+                self.young[key] = (cur, now + SETTLE)
 
     def drop_tree(self, path):
         prefix = path + os.sep
@@ -302,6 +340,8 @@ class Watcher:
 STATE_PATH = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
                           "live-gallery", "state.json")
 
+
+SETTLE = 1.0  # seconds a file found mid-copy must stay unchanged before it is shown
 
 THUMB_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
                          "live-gallery", "thumbs")
@@ -442,7 +482,7 @@ class App:
         threading.Thread(target=run, daemon=True).start()
 
     def listing(self, q):
-        """Newest first. `before`/`before_id` continue from the last item of the previous page."""
+        """Newest first. `before`/`before_m`/`before_id` continue from the last item of the previous page."""
         with self.lock:
             w, indexing = self.w, self.indexing
         with w.lock:
@@ -452,14 +492,15 @@ class App:
         try:
             root = int(q["root"]) if "root" in q else None
             limit = max(1, min(500, int(q.get("limit") or self.initial)))
-            before = (float(q["before"]), q.get("before_id", "")) if "before" in q else None
+            before = ((float(q["before"]), float(q.get("before_m") or 0), q.get("before_id", ""))
+                      if "before" in q else None)
         except ValueError:
             root, limit, before = None, self.initial, None
         if kind or text or root is not None:
             items = [i for i in items if (not kind or i["kind"] == kind) and (root is None or i["root"] == root)
                      and (not text or text in i["rel"].lower())]
         total = len(items)
-        order = lambda i: (i["mtime"], i["id"])
+        order = lambda i: (i["at"], i["mtime"], i["id"])  # most recently arrived or changed first
         if before:
             items = [i for i in items if order(i) < before]
         items.sort(key=order, reverse=True)
@@ -729,7 +770,10 @@ self.onmessage = async e => {
   try {
     await drawThumb(kit, url, ext);
     postMessage({ blob: await kit.r.domElement.convertToBlob({ type: 'image/webp', quality: 0.9 }) });
-  } catch (err) { postMessage({ error: String(err?.message || err) }); }
+  } catch (err) {
+    const error = String(err?.message || err);  // `dom`: this loader needs the page (it touched document/Image)
+    postMessage({ error, dom: /document|window|Image|createElement/.test(error) });
+  }
 };
 """
 
@@ -851,13 +895,12 @@ function placeholder(it, note) { const p = el('div', 'ph', it.ext.toUpperCase())
 function makeCard(it, fresh) {
   const c = el('div', 'card'); c.dataset.id = it.id;
   const th = el('div', it.kind === 'model' ? 'thumb model' : 'thumb'); th._it = it;
-  const cached = it.thumb ? 't/' + it.tkey : null;
+  const cached = it.kind === 'model' && it.thumb ? 't/' + it.tkey : null;  // saved 3D thumbnail
   if (it.kind === 'image') {
     const img = new Image(); img.loading = 'lazy'; img.decoding = 'async'; img.alt = it.name;
-    let full = !cached;  // showing the original file rather than a small thumbnail
-    img.onload = () => { img.classList.add('ready'); if (full && shrinkable(it, img)) { full = false; shrinkQ.push({ it, th, img }); pumpShrink(); } };
-    img.onerror = () => { if (!full && !th._blob) { full = true; img.src = src(it); } else th.replaceChildren(placeholder(it, 'can’t display')); };
-    img.src = cached || src(it); th.append(img);
+    img.onload = () => img.classList.add('ready');
+    img.onerror = () => th.replaceChildren(placeholder(it, 'can’t display'));
+    img.src = src(it); th.append(img);
   } else if (cached) {
     const img = new Image(); img.loading = 'lazy'; img.decoding = 'async'; img.alt = it.name;
     img.onload = () => img.classList.add('ready');
@@ -873,44 +916,76 @@ function makeCard(it, fresh) {
   const sub = el('div', 'sub'); const a = el('span', 'ago', ago(it.mtime)); a.dataset.t = it.mtime;
   sub.append(a, el('span', null, fmtSize(it.size)));
   meta.append(dir, sub); c.append(meta);
-  if (fresh) {
-    c.classList.add('fresh'); if (fresh === 'update') c.classList.add('upd');
-    c.append(el('span', 'tag' + (fresh === 'update' ? ' upd' : ''), fresh === 'update' ? 'updated' : 'new'));
-    setTimeout(() => c.classList.remove('fresh'), 20000);
-  }
+  if (fresh) markFresh(c, fresh);
   c.onclick = () => openLb(it.id);
   return c;
 }
+function markFresh(c, type) {
+  c.classList.add('fresh'); if (type === 'update') c.classList.add('upd');
+  c.append(el('span', 'tag' + (type === 'update' ? ' upd' : ''), type === 'update' ? 'updated' : 'new'));
+  setTimeout(() => c.classList.remove('fresh'), 20000);
+}
 function revoke(th) { if (th?._blob) { URL.revokeObjectURL(th._blob); th._blob = null; } }
 function dropCard(id) { const c = cards.get(id); if (!c) return; revoke(c.el.firstChild); c.el.remove(); cards.delete(id); }
-function clearGrid() { for (const c of cards.values()) revoke(c.el.firstChild); grid.replaceChildren(); cards.clear(); thumbQ.length = 0; shrinkQ.length = 0; }
+function clearGrid() { for (const c of cards.values()) revoke(c.el.firstChild); grid.replaceChildren(); cards.clear(); thumbQ.length = 0; }
 
-// ---------- live events: applied once per frame, so a burst of 200 files is one update ----------
-let inbox = [], flushRaf = 0;
+// ---------- live events ----------
+// A few new files show up at once. A flood (a whole folder copied in) is collected until it pauses,
+// then shown in one go as the newest page, instead of building and loading a card for every file.
+const BULK = 60;
+let inbox = [], flushTimer = 0, inboxSince = 0, lastEvent = 0;
+const waiting = new Map();  // id -> 'add' | 'update': arrived in a flood while you were scrolled down
 function enqueue(ev) {
-  inbox.push(ev);
-  if (document.hidden) flush();  // frames don't run in a background tab
-  else if (!flushRaf) flushRaf = requestAnimationFrame(flush);
+  const now = performance.now();
+  if (!inbox.length) inboxSince = now;
+  inbox.push(ev); lastEvent = now;
+  if (!flushTimer) flushTimer = setTimeout(tryFlush, 40);
 }
+function tryFlush() {
+  flushTimer = 0; const now = performance.now();
+  if (inbox.length > 20 && now - lastEvent < 120 && now - inboxSince < 1500) { flushTimer = setTimeout(tryFlush, 120); return; }
+  flush();
+}
+const arrival = (a, b) => a.at - b.at || a.mtime - b.mtime || (a.id < b.id ? -1 : 1);
 function flush() {
-  cancelAnimationFrame(flushRaf); flushRaf = 0;
-  const evs = inbox; inbox = []; let open = null;
-  for (const ev of evs) {
-    if (ev.type === 'remove') {
-      if (cards.has(ev.id) || matches(ev)) total = Math.max(0, total - 1);
-      dropCard(ev.id); continue;
-    }
-    const it = ev.item; if (!matches(it)) continue;
+  const last = new Map(); for (const ev of inbox) last.set(ev.type === 'remove' ? ev.id : ev.item.id, ev);  // latest event per file
+  inbox = [];
+  const adds = []; let removed = 0;
+  for (const ev of last.values()) {
+    if (ev.type !== 'remove') { if (matches(ev.item)) adds.push(ev); continue; }
+    if (cards.has(ev.id) || matches(ev)) total = Math.max(0, total - 1);
+    if (cards.has(ev.id)) { dropCard(ev.id); removed++; }
+  }
+  if (removed && total > cards.size && adds.length <= BULK) {  // files went away: bring older ones back in
+    if (!cards.size && !adds.length) return load();
+    more = true; fillViewport();
+  }
+  if (document.hidden && adds.length) { unseen += adds.length; document.title = `(${unseen}) ${baseTitle}`; }
+  if (adds.length > BULK) return bulk(adds);
+  let open = null;
+  for (const ev of adds.sort((a, b) => arrival(a.item, b.item))) {
+    const it = ev.item;
     if (cards.has(it.id)) dropCard(it.id); else if (ev.type === 'add') total++;
     const c = makeCard(it, ev.type); cards.set(it.id, { it, el: c }); grid.prepend(c);
-    if (document.hidden) unseen++;
     if (lbId === it.id || follow) open = it.id;
   }
-  if (unseen) document.title = `(${unseen}) ${baseTitle}`;
   // Don't let a long session pile up thousands of cards; older ones come back when you scroll down.
   if (cards.size > TRIM_AT && scrollY < innerHeight) { while (cards.size > KEEP) dropCard(grid.lastElementChild.dataset.id); more = true; }
   counts();
   if (open && cards.has(open)) openLb(open);
+}
+async function bulk(adds) {
+  if (scrollY > innerHeight) {  // you're looking at older files: don't yank the page, just say so
+    for (const ev of adds) { if (ev.type === 'add' && !cards.has(ev.item.id) && !waiting.has(ev.item.id)) total++; waiting.set(ev.item.id, ev.type); }
+    counts(); status(`↑ ${waiting.size} new files`); $('#status').title = 'Scroll to the top to see them';
+    return;
+  }
+  await reloadMarking(new Map(adds.map(ev => [ev.item.id, ev.type])));
+}
+async function reloadMarking(types) {
+  await load();
+  for (const [id, c] of cards) if (types.has(id)) markFresh(c.el, types.get(id));
+  if (follow && grid.firstElementChild) openLb(grid.firstElementChild.dataset.id);
 }
 function counts() {
   const n = cards.size;
@@ -940,7 +1015,7 @@ function listUrl(after) {
   if (filter !== 'all') p.set('kind', filter);
   if (rootFilter !== null) p.set('root', rootFilter);
   if (query) p.set('q', query);
-  if (after) { p.set('before', after.mtime); p.set('before_id', after.id); }
+  if (after) { p.set('before', after.at); p.set('before_m', after.mtime); p.set('before_id', after.id); }
   return 'api/list?' + p;
 }
 async function load() {
@@ -950,8 +1025,8 @@ async function load() {
   if (rootFilter !== null && rootsText(d.roots) !== rootsText(roots)) { rootFilter = null; return load(); }
   roots = d.roots; recent = d.recent || []; indexing = d.indexing; labels = shortLabels(roots); mode = d.mode;
   baseTitle = 'Live Gallery · ' + labels.join(', '); if (!unseen) document.title = baseTitle;
-  status(indexing ? 'indexing…' : ''); dot(); renderChips();
-  clearGrid(); inbox = []; held = []; pauseLabel();
+  waiting.clear(); status(indexing ? 'indexing…' : ''); $('#status').title = ''; dot(); renderChips();
+  clearGrid();
   total = d.total; more = d.more;
   for (const it of d.items) { const c = makeCard(it, null); cards.set(it.id, { it, el: c }); grid.append(c); }
   counts(); if (!$('#watch').value) showRecent(); fillViewport();
@@ -970,14 +1045,16 @@ async function loadMore() {
 const nearBottom = () => $('#more').getBoundingClientRect().top < innerHeight + 900;
 let fillRaf = 0;
 function fillViewport() { if (!fillRaf) fillRaf = requestAnimationFrame(() => { fillRaf = 0; if (more && nearBottom()) loadMore(); }); }
-addEventListener('scroll', fillViewport, { passive: true }); addEventListener('resize', fillViewport);
+addEventListener('scroll', () => { fillViewport(); if (waiting.size && scrollY < 200) reloadMarking(new Map(waiting)); }, { passive: true });
+addEventListener('resize', fillViewport);
+$('#status').onclick = () => { if (waiting.size) scrollTo({ top: 0 }); };
 function connect() {
   const es = new EventSource('events'); let broke = false;
   es.onopen = () => { live = true; dot(); if (broke) load(); broke = false; };
   es.onerror = () => { live = false; dot(); broke = true; };
   es.onmessage = e => {
     const ev = JSON.parse(e.data);
-    if (ev.type === 'reset') { closeLb(); load(); return; }
+    if (ev.type === 'reset') { inbox = []; held = []; pauseLabel(); closeLb(); load(); return; }  // the watched folders changed
     if (paused && ev.type !== 'remove') { held.push(ev); pauseLabel(); } else enqueue(ev);
   };
 }
@@ -1045,33 +1122,10 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) { un
 setInterval(() => { for (const a of document.querySelectorAll('.ago')) a.textContent = ago(+a.dataset.t); }, 15000);
 
 // ---------- thumbnails ----------
-// Made once, then kept by the server on disk, so nothing is redone on the next visit.
+// 3D thumbnails are made once, then kept by the server on disk, so nothing is redone on the next visit.
 function saveThumb(it, blob) {
   fetch('api/thumb?id=' + encodeURIComponent(it.id) + '&v=' + it.mtime, { method: 'POST', headers: { 'Content-Type': blob.type || 'image/png' }, body: blob }).catch(() => {});
 }
-const idle = () => new Promise(r => (window.requestIdleCallback || setTimeout)(r, { timeout: 500 }));
-
-// Images: the original shows first; big ones are then swapped for a small copy to free memory.
-const shrinkable = (it, img) => !/^(svg|gif|ico)$/.test(it.ext) && (it.size > 120000 || Math.max(img.naturalWidth, img.naturalHeight) > 1024);
-const shrinkQ = []; let shrinking = false;
-async function pumpShrink() {
-  if (shrinking) return; shrinking = true;
-  while (shrinkQ.length) {
-    const { it, th, img } = shrinkQ.shift(); if (!img.isConnected) continue;
-    await idle();
-    try {
-      const k = Math.min(1, THUMB / Math.max(img.naturalWidth, img.naturalHeight)), c = document.createElement('canvas');
-      c.width = Math.max(1, Math.round(img.naturalWidth * k)); c.height = Math.max(1, Math.round(img.naturalHeight * k));
-      const g = c.getContext('2d'); g.imageSmoothingQuality = 'high'; g.drawImage(img, 0, 0, c.width, c.height);
-      const blob = await new Promise(r => c.toBlob(r, 'image/webp', 0.86));
-      if (!blob) continue;
-      saveThumb(it, blob);
-      if (img.isConnected) { th._blob = URL.createObjectURL(blob); img.src = th._blob; }
-    } catch (e) { console.warn('thumbnail failed', it.rel, e); }
-  }
-  shrinking = false;
-}
-
 // 3D: rendered in a worker when the card scrolls into view, one at a time, new arrivals first.
 const thumbQ = []; let busy = false;
 const thumbObserver = new IntersectionObserver(es => {
@@ -1082,6 +1136,8 @@ async function pump() {
   if (busy) return; busy = true;
   while (thumbQ.length) {
     const th = thumbQ.shift(); if (!th.isConnected) continue; const it = th._it;
+    const box = th.getBoundingClientRect();
+    if (box.bottom < -400 || box.top > innerHeight + 400) { thumbObserver.observe(th); continue; }  // scrolled away: do it when it comes back
     try {
       const blob = await renderModel(it);
       saveThumb(it, blob);
@@ -1099,7 +1155,10 @@ async function pump() {
 }
 let worker = null, job = null, pageKit = null, useWorker = typeof OffscreenCanvas !== 'undefined' && typeof Worker !== 'undefined';
 async function renderModel(it) {
-  if (useWorker) { try { return await viaWorker(it); } catch (e) { console.warn('worker thumbnail failed, rendering on the page instead:', it.rel, e.message); } }
+  if (useWorker) {
+    try { return await viaWorker(it); }
+    catch (e) { if (useWorker && !e.dom) throw e; }  // a bad or unfinished model: don't parse it again on the page
+  }  // no worker support, or a loader that needs the page (textured FBX/OBJ): render here instead
   if (!pageKit) pageKit = await thumbKit(document.createElement('canvas'), THUMB);
   await drawThumb(pageKit, src(it), it.ext);
   return await new Promise((ok, no) => pageKit.r.domElement.toBlob(b => b ? ok(b) : no(new Error('toBlob failed')), 'image/webp', 0.9));
@@ -1110,7 +1169,7 @@ function viaWorker(it) {
   return new Promise((ok, no) => {
     if (!worker) {
       worker = new Worker('worker.js', { type: 'module' });
-      worker.onmessage = e => { if (e.data.fatal) { useWorker = false; killWorker(new Error(e.data.error)); } else endJob(e.data.error && new Error(e.data.error), e.data.blob); };
+      worker.onmessage = e => { if (e.data.fatal) { useWorker = false; killWorker(new Error(e.data.error)); } else endJob(e.data.error && Object.assign(new Error(e.data.error), { dom: e.data.dom }), e.data.blob); };
       worker.onerror = e => { useWorker = false; killWorker(new Error(e.message || 'worker failed to start')); };
     }
     job = { ok, no, timer: setTimeout(() => killWorker(new Error('timed out')), 180000) };
