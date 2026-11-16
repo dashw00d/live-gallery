@@ -1,0 +1,36 @@
+
+thread 'main' (13382) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cosmic-text-0.14.2/src/shape.rs:895:13:
+assertion `left == right` failed
+  left: true
+ right: false
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'main' (58669) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cosmic-text-0.14.2/src/shape.rs:895:13:
+assertion `left == right` failed
+  left: true
+ right: false
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'main' (60597) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cosmic-text-0.14.2/src/shape.rs:895:13:
+assertion `left == right` failed
+  left: true
+ right: false
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'main' (61181) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cosmic-text-0.14.2/src/shape.rs:895:13:
+assertion `left == right` failed
+  left: true
+ right: false
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'main' (62343) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cosmic-text-0.14.2/src/shape.rs:895:13:
+assertion `left == right` failed
+  left: true
+ right: false
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'main' (62954) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cosmic-text-0.14.2/src/shape.rs:895:13:
+assertion `left == right` failed
+  left: true
+ right: false
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
