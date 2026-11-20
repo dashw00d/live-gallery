@@ -944,6 +944,19 @@ class LiveStreamApp:
         except OSError:
             return
 
+    def latest_revision_path(self, iid):
+        rdir = os.path.join(revisions_dir(), iid)
+        if not os.path.isdir(rdir):
+            return None
+        try:
+            entries = sorted(
+                (e for e in os.scandir(rdir) if e.is_file()),
+                key=lambda x: x.name,
+            )
+            return entries[-1].path if entries else None
+        except OSError:
+            return None
+
     def list_revisions(self, iid):
         rdir = os.path.join(revisions_dir(), iid)
         if not os.path.isdir(rdir):
@@ -1118,7 +1131,7 @@ class LiveStreamApp:
         should_snapshot = False
         with self.lock:
             existing = self.items.get(item["id"])
-            if existing and existing.get("mtime_ns") == item["mtime_ns"] and existing.get("size") == item["size"]:
+            if existing and not existing.get("deleted") and existing.get("mtime_ns") == item["mtime_ns"] and existing.get("size") == item["size"]:
                 # Update attribution even if file bytes didn't change
                 if item["convo"] and not existing.get("convo"):
                     existing["convo"] = item["convo"]
@@ -1136,7 +1149,7 @@ class LiveStreamApp:
                 self._prune_if_needed()
         if notify and not defer_prune:
             # Snapshot on first live write & every subsequent live update so revisions accumulate
-            if should_snapshot or (ev == "add" and time.time() - item["mtime"] < 120):
+            if should_snapshot or (ev == "add" and time.time() - item["mtime"] < 3600):
                 self._snapshot_revision(item)
         if notify:
             self._queue_event(item["id"], ev)
@@ -1145,14 +1158,27 @@ class LiveStreamApp:
     def _delete_file_path(self, full_path):
         rpath = os.path.realpath(full_path)
         with self.lock:
-            iid = self.file_index.pop(rpath, None)
+            iid = self.file_index.get(rpath)
             if not iid:
-                # Fallback match by stored full_path
                 for k, v in list(self.items.items()):
                     if v.get("full_path") == full_path or v.get("full_path") == rpath:
                         iid = k
                         break
-            if iid and iid in self.items:
+            if not iid or iid not in self.items:
+                return
+            it = self.items[iid]
+            rev_path = self.latest_revision_path(iid)
+            if rev_path:
+                # Keep the last saved snapshot visible with a REMOVED visual indicator!
+                it["deleted"] = True
+                it["deleted_at"] = time.time()
+                if it["kind"] in ("code", "text") and it.get("ext") != "pdf" and not it.get("snippet"):
+                    snip, lines = read_text_snippet(rev_path)
+                    it["snippet"] = snip
+                    it["lines"] = lines
+                self._queue_event(iid, "update")
+            else:
+                self.file_index.pop(rpath, None)
                 self.items.pop(iid, None)
                 self._queue_event(iid, "delete")
 
@@ -1648,15 +1674,22 @@ class LiveStreamApp:
 
     def public_item(self, it):
         if it.get("snippet") is None:
-            if it["kind"] in ("code", "text") and it.get("ext") != "pdf" and it.get("full_path"):
-                snip, lines = read_text_snippet(it["full_path"])
-                it["snippet"] = snip
-                it["lines"] = lines
+            if it["kind"] in ("code", "text") and it.get("ext") != "pdf":
+                src = it.get("full_path") or ""
+                if not (src and os.path.isfile(src)):
+                    src = self.latest_revision_path(it["id"]) or ""
+                if src:
+                    snip, lines = read_text_snippet(src)
+                    it["snippet"] = snip
+                    it["lines"] = lines
+                else:
+                    it["snippet"] = ""
             else:
                 it["snippet"] = ""
         pub = {k: v for k, v in it.items() if k not in ("full_text", "mtime_ns")}
         key = it.get("full_path") or it["id"]
         pub["starred"] = (key in self.starred) or (it["id"] in self.starred)
+        pub["deleted"] = bool(it.get("deleted"))
         return pub
 
     def _is_under(self, path, parent):
@@ -2093,7 +2126,12 @@ def make_handler(app, bound_port):
                     "convo": it.get("convo", ""),
                     "model": it.get("model", ""),
                 })
-            text, truncated, size = read_text_full(it["full_path"])
+            src_path = it["full_path"]
+            if not (src_path and os.path.isfile(src_path)):
+                src_path = app.latest_revision_path(iid) or ""
+                if src_path:
+                    it["deleted"] = True
+            text, truncated, size = read_text_full(src_path) if src_path else (None, False, 0)
             if text is None:
                 return self.send_json({"error": "unreadable"}, 404)
             return self.send_json({
@@ -2107,6 +2145,7 @@ def make_handler(app, bound_port):
                 "truncated": truncated,
                 "size": size,
                 "convo": it.get("convo", ""),
+                "deleted": bool(it.get("deleted")),
             })
 
         def serve_thumb(self, tkey):
@@ -2147,7 +2186,15 @@ def make_handler(app, bound_port):
                     return self.send_error(403)
                 full = cand
             if not os.path.isfile(full):
+                if not extra:
+                    rev = app.latest_revision_path(base_id)
+                    if rev and os.path.isfile(rev):
+                        it["deleted"] = True
+                        return self._stream_local_file(rev, versioned=True)
                 return self.send_error(404)
+            # Opportunistically snapshot recent viewed files so if they get cleaned up we still have the last version
+            if not extra and time.time() - it.get("mtime", 0) < 3600:
+                app._snapshot_revision(it)
             return self._stream_local_file(full, versioned=versioned)
 
         def _stream_local_file(self, full, versioned=False):
