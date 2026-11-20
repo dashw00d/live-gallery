@@ -1,0 +1,1569 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Live Gallery</title>
+<script src="/preload.js"></script>
+<style>
+:root{
+  --bg:#0d1016; --panel:#131720; --card:#181d28; --card-hover:#1e2534;
+  --line:#252c3b; --text:#e8ecf4; --muted:#8b95a9; --accent:#6aa9ff;
+  --new:#4ade80; --upd:#fbbf24; --star:#facc15; --danger:#f87171;
+  --code-bg:#0f131b; --badge-bg:rgba(13,16,22,.82);
+  --size:220px; color-scheme:dark;
+}
+:root[data-theme="light"]{
+  --bg:#f5f7fb; --panel:#ffffff; --card:#ffffff; --card-hover:#f0f4fa;
+  --line:#dce2ee; --text:#182030; --muted:#616d82; --accent:#2563eb;
+  --new:#16a34a; --upd:#d97706; --star:#ca8a04; --danger:#dc2626;
+  --code-bg:#f3f5fa; --badge-bg:rgba(255,255,255,.9);
+  color-scheme:light;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;height:100%}
+button,input,select{font:inherit;color:inherit}
+header{position:sticky;top:0;z-index:20;background:var(--panel);border-bottom:1px solid var(--line);padding:8px 10px;display:flex;flex-direction:column;gap:7px}
+.row{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:6px;font-weight:600;letter-spacing:.01em;margin-right:4px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--new);box-shadow:0 0 8px var(--new)}
+.dot.off{background:#ef4444;box-shadow:none}
+.search{flex:1;min-width:110px;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:4px 8px;outline:none}
+.search:focus{border-color:var(--accent)}
+.btn{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:3px 8px;cursor:pointer;white-space:nowrap;font-size:12px}
+.btn:hover{border-color:var(--accent)}
+.btn.on{background:rgba(106,169,255,.16);border-color:var(--accent);color:var(--accent)}
+.btn.star-on{background:rgba(250,204,21,.15);border-color:var(--star);color:var(--star)}
+.tabs{display:flex;gap:4px;overflow-x:auto;scrollbar-width:none;padding-bottom:1px}
+.tabs::-webkit-scrollbar{display:none}
+.tab{background:transparent;border:1px solid var(--line);border-radius:999px;padding:2px 9px;cursor:pointer;font-size:11.5px;color:var(--muted);white-space:nowrap;display:inline-flex;align-items:center;gap:5px}
+.tab.on{background:var(--accent);border-color:var(--accent);color:#09111f;font-weight:600}
+.tab .cnt{opacity:.75;font-variant-numeric:tabular-nums}
+.roots-bar{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+.chip{display:inline-flex;align-items:center;gap:4px;background:var(--bg);border:1px solid var(--line);border-radius:999px;padding:2px 8px;font-size:11px;color:var(--muted);cursor:pointer;max-width:220px}
+.chip.on{border-color:var(--accent);color:var(--accent)}
+.chip.muted-chip{border-style:dashed;color:var(--danger);opacity:.85}
+.chip .adot{width:5px;height:5px;border-radius:50%;background:var(--new);flex:none}
+.chip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chip .x{opacity:.6;padding:0 2px}
+.chip .x:hover{opacity:1;color:var(--danger)}
+.add-box{display:none;gap:6px;align-items:center;position:relative}
+.add-box.open{display:flex}
+.add-box input{flex:1;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:4px 8px;outline:none}
+.ac{position:absolute;top:100%;left:0;right:68px;background:var(--panel);border:1px solid var(--line);border-radius:6px;margin-top:3px;max-height:180px;overflow:auto;z-index:30;display:none}
+.ac.open{display:block}
+.ac div{padding:5px 8px;cursor:pointer;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ac div:hover{background:var(--card-hover)}
+.banner{display:none;position:sticky;top:92px;z-index:15;margin:8px 10px 0;padding:6px 10px;border-radius:7px;background:rgba(106,169,255,.15);border:1px solid var(--accent);color:var(--text);font-size:12px;cursor:pointer;text-align:center}
+.banner.show{display:block}
+
+main{padding:10px;padding-bottom:64px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(var(--size),100%),1fr));gap:10px}
+.empty{padding:48px 16px;text-align:center;color:var(--muted)}
+.card{position:relative;background:var(--card);border:1px solid var(--line);border-radius:9px;overflow:hidden;cursor:pointer;display:flex;flex-direction:column;transition:border-color .15s,transform .12s}
+.card:hover{border-color:var(--accent);background:var(--card-hover)}
+.card.is-new{animation:pop .35s ease;border-color:var(--new)}
+.card.is-upd{border-color:var(--upd)}
+.card.cmp-a{border-color:var(--star);box-shadow:0 0 0 1px var(--star)}
+@keyframes pop{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
+.thumb{position:relative;aspect-ratio:4/3;background:var(--code-bg);overflow:hidden;display:flex;align-items:center;justify-content:center}
+.thumb.media{aspect-ratio:1/1;background:repeating-conic-gradient(rgba(128,128,128,.08) 0% 25%,transparent 0% 50%) 50%/16px 16px,var(--code-bg)}
+.thumb img,.thumb video{width:100%;height:100%;object-fit:contain;display:block}
+.thumb.contain img{object-fit:contain;padding:4px}
+.thumb pre{margin:0;padding:8px 9px;width:100%;height:100%;overflow:hidden;font:11px/1.42 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--text);white-space:pre-wrap;word-break:break-word;opacity:.92;mask-image:linear-gradient(180deg,#000 72%,transparent)}
+.thumb .agent-preview{padding:10px;width:100%;height:100%;overflow:hidden;font-size:12px;line-height:1.45;color:var(--text);mask-image:linear-gradient(180deg,#000 75%,transparent)}
+.thumb .audio-box{padding:12px;width:100%;display:flex;flex-direction:column;align-items:center;gap:8px}
+.thumb .audio-box audio{width:100%;height:32px}
+.thumb .pdf-box{font-size:28px;opacity:.75;display:flex;flex-direction:column;align-items:center;gap:4px}
+.thumb .pdf-box small{font-size:11px;color:var(--muted)}
+.pill{position:absolute;top:6px;left:6px;background:var(--badge-bg);backdrop-filter:blur(6px);border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.pill.new{left:auto;right:6px;background:var(--new);color:#052e16;border-color:transparent}
+.pill.upd{left:auto;right:6px;background:var(--upd);color:#451a03;border-color:transparent}
+.card-acts{position:absolute;bottom:6px;right:6px;display:flex;gap:4px;opacity:0;transition:opacity .12s}
+.card:hover .card-acts,.card-acts.pinned{opacity:1}
+.cbtn{background:var(--badge-bg);backdrop-filter:blur(6px);border:1px solid var(--line);border-radius:5px;padding:2px 6px;font-size:11px;cursor:pointer;color:var(--text)}
+.cbtn:hover{border-color:var(--accent);color:var(--accent)}
+.cbtn.starred{color:var(--star);border-color:var(--star);opacity:1}
+.meta{padding:7px 9px;display:flex;flex-direction:column;gap:2px;border-top:1px solid var(--line)}
+.name{font-weight:600;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sub{display:flex;justify-content:space-between;gap:6px;font-size:11px;color:var(--muted)}
+.sub span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.attr{font-size:10.5px;color:var(--accent);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* Folded batch card */
+.stack-card{border-style:dashed;border-color:var(--accent)}
+.stack-thumbs{display:grid;grid-template-columns:1fr 1fr;gap:2px;width:100%;height:100%;background:var(--bg);padding:2px}
+.stack-thumbs .st-cell{background:var(--code-bg);overflow:hidden;display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--muted)}
+.stack-thumbs img{width:100%;height:100%;object-fit:contain}
+
+/* Floating A/B Compare tray */
+.cmp-tray{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:40;display:none;align-items:center;gap:8px;padding:7px 12px;border-radius:999px;background:var(--panel);border:1px solid var(--star);box-shadow:0 8px 28px rgba(0,0,0,.45);font-size:12px}
+.cmp-tray.show{display:flex}
+
+/* Modals */
+.modal{position:fixed;inset:0;z-index:50;background:rgba(6,8,12,.9);backdrop-filter:blur(8px);display:none;flex-direction:column}
+.modal.open{display:flex}
+.m-top{display:flex;align-items:center;gap:6px;padding:7px 10px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
+.m-title{flex:1;min-width:120px}
+.m-title strong{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.m-title small{display:block;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.m-subbar{display:none;flex-wrap:wrap;align-items:center;gap:5px;padding:5px 10px;background:var(--panel);border-bottom:1px solid var(--line)}
+.m-subbar.show{display:flex}
+.m-subbar .sep{width:1px;height:16px;background:var(--line);margin:0 2px}
+.m-subbar .btn{padding:2px 7px;font-size:11.5px}
+.m-body{flex:1;min-height:0;position:relative;display:flex;align-items:center;justify-content:center;overflow:hidden;touch-action:none}
+.m-body.pz{cursor:grab}
+.m-body.pz.grabbing{cursor:grabbing}
+.m-body img{max-width:100%;max-height:100%;user-select:none;-webkit-user-drag:none;transform-origin:center;will-change:transform}
+.m-body video{max-width:100%;max-height:100%;background:#000;transform-origin:center;will-change:transform}
+.m-zoom{display:none;align-items:center;gap:4px}
+.m-zoom.show{display:inline-flex}
+.m-zoom .zpct{min-width:40px;text-align:center;font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+.m-stats{position:absolute;left:10px;bottom:10px;padding:3px 8px;border-radius:6px;background:var(--badge-bg);border:1px solid var(--line);font-size:11px;color:var(--muted);pointer-events:none;font-variant-numeric:tabular-nums;z-index:5}
+.m-body audio{width:min(520px,90%)}
+.m-body canvas.view3d{width:100%!important;height:100%!important;display:block}
+.m-body iframe{width:100%;height:100%;border:0;background:#fff}
+.m-text{width:100%;height:100%;overflow:auto;padding:14px 18px;margin:0;background:var(--code-bg);color:var(--text);font:12.5px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word}
+.m-text.prose{font:13.5px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;max-width:860px;margin:0 auto;width:100%}
+.diff-line{display:block;padding:0 4px}
+.diff-add{background:rgba(74,222,128,.16);color:#86efac}
+.diff-del{background:rgba(248,113,113,.16);color:#fca5a5}
+.diff-hdr{color:var(--accent);font-weight:600}
+.m-foot{display:flex;align-items:center;gap:6px;padding:8px 10px;background:var(--panel);border-top:1px solid var(--line)}
+.m-foot input{flex:1;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 9px;outline:none}
+.m-foot input:focus{border-color:var(--accent)}
+.status-msg{font-size:11.5px;color:var(--muted)}
+
+/* Annotation canvas */
+.anno-wrap{position:relative;max-width:100%;max-height:100%;display:flex;align-items:center;justify-content:center}
+.anno-wrap canvas{max-width:100%;max-height:100%;cursor:crosshair;box-shadow:0 0 0 1px var(--line)}
+.swatch{width:16px;height:16px;border-radius:50%;border:2px solid transparent;cursor:pointer;padding:0}
+.swatch.on{border-color:#fff;transform:scale(1.15)}
+
+/* Compare modal */
+.cmp-split{position:relative;width:100%;height:100%;display:grid;grid-template-columns:1fr 1fr;gap:2px;background:var(--line)}
+.cmp-pane{position:relative;background:var(--code-bg);overflow:hidden;display:flex;align-items:center;justify-content:center;min-width:0;min-height:0}
+.cmp-pane .cmp-lbl{position:absolute;top:8px;left:8px;z-index:6;padding:2px 8px;border-radius:5px;background:var(--badge-bg);border:1px solid var(--line);font-size:11px;font-weight:600;max-width:80%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cmp-pane img{max-width:100%;max-height:100%;user-select:none;-webkit-user-drag:none;transform-origin:center}
+.cmp-pane canvas{width:100%!important;height:100%!important;display:block}
+.cmp-wipe{position:relative;width:100%;height:100%;background:var(--code-bg);overflow:hidden;display:flex;align-items:center;justify-content:center;user-select:none}
+.cmp-wipe .layer{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none}
+.cmp-wipe img{max-width:100%;max-height:100%;transform-origin:center;-webkit-user-drag:none}
+.cmp-handle{position:absolute;top:0;bottom:0;width:3px;background:var(--accent);cursor:ew-resize;z-index:10}
+.cmp-handle::after{content:"\2194";position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:28px;height:28px;border-radius:50%;background:var(--panel);border:2px solid var(--accent);display:flex;align-items:center;justify-content:center;font-size:13px;color:var(--text)}
+</style>
+</head>
+<body>
+<header>
+  <div class="row">
+    <div class="brand"><span class="dot" id="dot"></span>Live Gallery</div>
+    <input class="search" id="search" placeholder="Filter path, text, code... (/)" autocomplete="off">
+    <button class="btn on" id="btnScope" title="Filter to the current project (click to show all projects)">This project</button>
+    <button class="btn on" id="btnAuto" title="Automatically watch folders that agents write to">Auto-watch</button>
+    <button class="btn" id="btnGroup" title="Fold bursts of 4+ outputs from the same folder into a stack">Group</button>
+    <button class="btn" id="btnFollow" title="Auto-open each new arrival">Follow</button>
+    <button class="btn" id="btnPause" title="Hold incoming updates">Pause</button>
+    <button class="btn" id="btnAdd" title="Add a folder to watch">+ Folder</button>
+  </div>
+  <div class="add-box" id="addBox">
+    <input id="addInput" placeholder="/path/to/watch" autocomplete="off">
+    <button class="btn on" id="addGo">Watch</button>
+    <div class="ac" id="ac"></div>
+  </div>
+  <div class="tabs" id="tabs"></div>
+  <div class="roots-bar" id="rootsBar"></div>
+</header>
+
+<div class="banner" id="banner"></div>
+<main>
+  <div class="grid" id="grid"></div>
+  <div class="empty" id="empty" style="display:none">No outputs yet. Watch a workspace folder or start an agent turn — new 3D models, images, videos, code, and agent outputs will stream in here automatically.</div>
+</main>
+
+<div class="cmp-tray" id="cmpTray">
+  <span>Compare A: <strong id="cmpTrayName"></strong> — click any second card</span>
+  <button class="btn" id="cmpTrayCancel">Cancel</button>
+</div>
+
+<!-- Single item lightbox modal -->
+<div class="modal" id="modal">
+  <div class="m-top">
+    <div class="m-title"><strong id="mName"></strong><small id="mSub"></small></div>
+    <div class="m-zoom" id="mZoom">
+      <button class="btn" id="zOut" title="Zoom out (-)">&minus;</button>
+      <span class="zpct" id="zPct">Fit</span>
+      <button class="btn" id="zIn" title="Zoom in (+)">+</button>
+      <button class="btn" id="zOne" title="100% actual pixels (1)">1:1</button>
+      <button class="btn" id="zFit" title="Fit to view (0)">Fit</button>
+    </div>
+    <button class="btn" id="mStar" title="Star / bookmark (S)">&#9734;</button>
+    <button class="btn" id="mCmp" title="Pin as A for side-by-side compare">A/B</button>
+    <button class="btn" id="mAnno" title="Annotate / redline &amp; send to agent (D)" style="display:none">Annotate</button>
+    <button class="btn" id="mMute" title="Mute this subfolder from the stream" style="display:none">Mute dir</button>
+    <button class="btn" id="mPrev" title="Previous (Left Arrow)">&larr;</button>
+    <button class="btn" id="mNext" title="Next (Right Arrow)">&rarr;</button>
+    <button class="btn" id="mCopy">Copy path</button>
+    <button class="btn" id="mClose">Esc</button>
+  </div>
+  <div class="m-subbar" id="m3dBar">
+    <button class="btn" data-m3d="shaded" title="Original / PBR shaded (1)">Shaded</button>
+    <button class="btn" data-m3d="clay" title="Matte sculpt clay (2)">Clay</button>
+    <button class="btn" data-m3d="ao" title="Pure Ambient Occlusion cavity pass (3)">AO</button>
+    <button class="btn" data-m3d="matcap" title="Studio Matcap (4)">Matcap</button>
+    <button class="btn" data-m3d="normals" title="Normal map colors (5)">Normals</button>
+    <button class="btn" data-m3d="flat" title="Flat faceted shading (6)">Flat</button>
+    <span class="sep"></span>
+    <button class="btn" id="b3dAO" title="Toggle real-time GTAO overlay (A)">+AO</button>
+    <button class="btn" id="b3dLines" title="Toggle quad/polygon edge lines (L)">Lines</button>
+    <button class="btn" id="b3dWire" title="Toggle triangle wireframe (W)">Wire</button>
+    <button class="btn" id="b3dTopo" title="Highlight non-quads (red tris, yellow n-gons) &amp; poles (T)">Topo</button>
+    <button class="btn" id="b3dBack" title="Highlight backfaces in red (B)">Back</button>
+    <button class="btn" id="b3dCam" title="Keep camera angle across arrow keys (C)">Lock Cam</button>
+    <button class="btn" id="b3dSpin" title="Turntable spin">Spin</button>
+    <button class="btn" id="b3dGrid" title="Toggle floor grid (G)">Grid</button>
+    <button class="btn" id="b3dReset" title="Reset camera (R)">Reset</button>
+  </div>
+  <div class="m-subbar" id="mAnnoBar">
+    <button class="btn on" data-atool="pen">Pen</button>
+    <button class="btn" data-atool="arrow">Arrow</button>
+    <button class="btn" data-atool="rect">Box</button>
+    <span class="sep"></span>
+    <button class="swatch on" data-acol="#ef4444" style="background:#ef4444" title="Red"></button>
+    <button class="swatch" data-acol="#facc15" style="background:#facc15" title="Yellow"></button>
+    <button class="swatch" data-acol="#38bdf8" style="background:#38bdf8" title="Cyan"></button>
+    <span class="sep"></span>
+    <button class="btn" id="aUndo">Undo</button>
+    <button class="btn" id="aClear">Clear</button>
+    <button class="btn on" id="aSend">Save &amp; Send to Agent</button>
+    <button class="btn" id="aCancel">Done</button>
+  </div>
+  <div class="m-subbar" id="mRevBar"></div>
+  <div class="m-subbar" id="mDiffBar">
+    <button class="btn on" id="bDiffView">Diff</button>
+    <button class="btn" id="bSrcView">Source</button>
+    <span class="status-msg" id="diffMeta"></span>
+  </div>
+  <div class="m-body" id="mBody"></div>
+  <div class="m-foot">
+    <input id="replyInput" placeholder="Send feedback about this item back to the agent...">
+    <button class="btn on" id="replySend">Send to Agent</button>
+    <span class="status-msg" id="replyStatus"></span>
+  </div>
+</div>
+
+<!-- A/B Side-by-Side Compare Modal -->
+<div class="modal" id="cmpModal">
+  <div class="m-top">
+    <div class="m-title"><strong id="cmpTitle">Compare A / B</strong><small id="cmpSub"></small></div>
+    <button class="btn on" id="cmpModeWipe" style="display:none">Slider</button>
+    <button class="btn" id="cmpModeSide" style="display:none">Side-by-Side</button>
+    <button class="btn" id="cmpReset">Reset view</button>
+    <button class="btn" id="cmpClose">Esc</button>
+  </div>
+  <div class="m-subbar" id="cmp3dBar">
+    <button class="btn" data-m3d="shaded">Shaded</button>
+    <button class="btn" data-m3d="clay">Clay</button>
+    <button class="btn" data-m3d="ao">AO</button>
+    <button class="btn" data-m3d="matcap">Matcap</button>
+    <button class="btn" data-m3d="normals">Normals</button>
+    <button class="btn" data-m3d="flat">Flat</button>
+    <span class="sep"></span>
+    <button class="btn" data-t3d="ao">+AO</button>
+    <button class="btn" data-t3d="lines">Lines</button>
+    <button class="btn" data-t3d="wire">Wire</button>
+    <button class="btn" data-t3d="topo">Topo</button>
+    <button class="btn" data-t3d="back">Back</button>
+    <button class="btn" data-t3d="grid">Grid</button>
+  </div>
+  <div class="m-body" id="cmpBody"></div>
+</div>
+
+<script>
+let kitPromise = null;
+function getKit() {
+  if (window.LiveGallery3D) return Promise.resolve(window.LiveGallery3D);
+  if (!kitPromise) {
+    kitPromise = new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = '/three-kit.js';
+      s.onload = () => window.LiveGallery3D ? resolve(window.LiveGallery3D) : reject(new Error('three-kit.js did not initialize'));
+      s.onerror = () => { kitPromise = null; reject(new Error('Failed to load /three-kit.js')); };
+      document.head.appendChild(s);
+    });
+  }
+  return kitPromise;
+}
+
+function apiFetch(url, opts) {
+  if (window.sidecar && typeof window.sidecar.fetch === 'function') {
+    return window.sidecar.fetch(url, opts);
+  }
+  return fetch(url, opts);
+}
+
+const $ = s => document.querySelector(s);
+const TABS = [
+  ['all', 'All'], ['starred', '\u2605'], ['media', 'Media'], ['model', '3D'], ['image', 'Img'],
+  ['video', 'Video'], ['audio', 'Audio'], ['code', 'Code'], ['text', 'Text'], ['agent', 'Agent']
+];
+
+let state = {
+  kind: 'all', root: '', q: '',
+  items: [], more: false, total: 0, counts: {}, roots: [], mutedDirs: [], recent: [], convos: [],
+  autoFollowDirs: true, scopeByProject: true,
+  groupBursts: false, expandedGroups: new Set(),
+  activeProject: '', activeProjectName: '',
+  activeConvo: (window.sidecar && window.sidecar.conversationId) || new URLSearchParams(location.search).get('conversationId') || '',
+  follow: false, paused: false, queued: 0, openIdx: -1, openItem: null,
+};
+let marks = new Map();
+let loading = false;
+let viewerCleanup = null;
+let compareA = null; // pinned item for A/B compare
+let compareCleanup = null;
+
+function uriToPath(u) {
+  if (!u || typeof u !== 'string') return '';
+  if (u.startsWith('file://')) {
+    try { return decodeURIComponent(new URL(u).pathname); } catch {}
+  }
+  return u;
+}
+
+function updateScopeButton() {
+  const btn = $('#btnScope');
+  if (!btn) return;
+  btn.classList.toggle('on', state.scopeByProject);
+  if (state.scopeByProject) {
+    btn.textContent = state.activeProjectName ? `Project: ${state.activeProjectName}` : 'This project';
+    btn.title = 'Filtering to this project (including external folders its agents write to) — click to show all projects';
+  } else {
+    btn.textContent = 'All projects';
+    btn.title = 'Showing all projects (remembered) — click to filter by current project';
+  }
+}
+
+window.addEventListener('message', e => {
+  const d = e.data;
+  if (!d || typeof d !== 'object') return;
+  const t = d.theme || d.colorTheme || (d.type === 'theme' ? d.value : null);
+  if (typeof t === 'string') {
+    document.documentElement.dataset.theme = /light/i.test(t) ? 'light' : 'dark';
+  }
+  if (d.type === 'open-file' && d.path) openExternalFile(d.path);
+});
+
+async function addHostUris(uris) {
+  if (!Array.isArray(uris) || !uris.length) return;
+  const primary = uriToPath(uris[0]);
+  if (primary && primary !== state.activeProject) {
+    state.activeProject = primary;
+    state.activeProjectName = primary.replace(/\/+$/, '').split('/').pop() || primary;
+    state.root = '';
+    updateScopeButton();
+  }
+  for (const u of uris) {
+    try {
+      await apiFetch('/api/watch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ add: u, project: primary || u, async: true }),
+      });
+    } catch {}
+  }
+}
+
+async function openExternalFile(rawPath) {
+  const p = uriToPath(rawPath);
+  if (!p) return;
+  try {
+    const r = await apiFetch('/api/item-by-path?path=' + encodeURIComponent(p));
+    if (!r.ok) return;
+    const d = await r.json();
+    if (d.item) openModalItem(d.item, -1);
+  } catch {}
+}
+
+async function syncHostWorkspaces() {
+  try {
+    if (window.sidecar && window.sidecar.conversationId) {
+      state.activeConvo = window.sidecar.conversationId;
+    }
+    if (window.sidecar && typeof window.sidecar.getWorkspaceUris === 'function') {
+      await addHostUris(await window.sidecar.getWorkspaceUris());
+    }
+    if (window.sidecar && typeof window.sidecar.onWorkspaceChange === 'function') {
+      window.sidecar.onWorkspaceChange(uris => { addHostUris(uris).then(() => fetchList(true)); });
+    }
+    if (window.sidecar && typeof window.sidecar.onFileOpen === 'function') {
+      window.sidecar.onFileOpen(p => openExternalFile(p));
+    }
+  } catch {}
+  updateScopeButton();
+}
+
+// --- 3D Thumbnail Worker (lazy via IntersectionObserver) ---
+let worker = null, workerBusy = false, thumbQueue = [], fallbackKit = null;
+const pending3D = new WeakMap();
+const thumbObserver = typeof IntersectionObserver !== 'undefined'
+  ? new IntersectionObserver(entries => {
+      for (const e of entries) {
+        if (!e.isIntersecting) continue;
+        const job = pending3D.get(e.target);
+        if (job) {
+          pending3D.delete(e.target);
+          thumbObserver.unobserve(e.target);
+          enqueueThumb(job.item, job.imgEl);
+        }
+      }
+    }, { rootMargin: '200px' })
+  : null;
+
+function observeThumb(cardEl, item, imgEl) {
+  if (!thumbObserver) { enqueueThumb(item, imgEl); return; }
+  pending3D.set(cardEl, { item, imgEl });
+  thumbObserver.observe(cardEl);
+}
+function initWorker() {
+  if (worker !== null) return;
+  try { worker = new Worker('/worker.js'); } catch { worker = false; }
+}
+function enqueueThumb(item, imgEl) { thumbQueue.push({ item, imgEl }); pumpThumbs(); }
+
+async function pumpThumbs() {
+  if (workerBusy || !thumbQueue.length) return;
+  const job = thumbQueue.shift();
+  if (!job.imgEl.isConnected) return pumpThumbs();
+  workerBusy = true;
+  const url = `/f/${job.item.id}?v=${job.item.mtime}`;
+  try {
+    let blob = null;
+    initWorker();
+    if (worker) {
+      blob = await new Promise((resolve, reject) => {
+        worker.onmessage = e => { if (e.data.error) reject(e.data); else resolve(e.data.blob); };
+        worker.onerror = err => reject({ error: err.message, fatal: true });
+        worker.postMessage({ url, ext: job.item.ext, size: 360 });
+      }).catch(async err => {
+        if (err && err.fatal) { worker.terminate(); worker = false; }
+        if (err && (err.dom || err.fatal)) return await renderThumbMain(url, job.item.ext);
+        throw err;
+      });
+    } else {
+      blob = await renderThumbMain(url, job.item.ext);
+    }
+    if (blob) {
+      job.imgEl.src = URL.createObjectURL(blob);
+      apiFetch(`/api/thumb?id=${encodeURIComponent(job.item.id)}&v=${encodeURIComponent(job.item.tkey)}`, {
+        method: 'POST', headers: { 'Content-Type': 'image/webp' }, body: blob,
+      }).catch(() => {});
+    }
+  } catch {}
+  workerBusy = false;
+  pumpThumbs();
+}
+
+async function renderThumbMain(url, ext) {
+  const { thumbKit, drawThumb } = await getKit();
+  if (!fallbackKit) {
+    const c = document.createElement('canvas'); c.width = 360; c.height = 360;
+    fallbackKit = await thumbKit(c, 360);
+  }
+  await drawThumb(fallbackKit, url, ext);
+  return await new Promise(res => fallbackKit.r.domElement.toBlob(res, 'image/webp', 0.9));
+}
+
+// --- Helpers ---
+function relTime(sec) {
+  const d = Math.max(0, Math.floor(Date.now() / 1000 - sec));
+  if (d < 5) return 'just now';
+  if (d < 60) return `${d}s ago`;
+  if (d < 3600) return `${Math.floor(d / 60)}m ago`;
+  if (d < 86400) return `${Math.floor(d / 3600)}h ago`;
+  return `${Math.floor(d / 86400)}d ago`;
+}
+function fmtSize(n) {
+  if (!n) return '';
+  if (n < 1024) return `${n} B`;
+  if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1048576).toFixed(1)} MB`;
+}
+function esc(s) {
+  return String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function parentDirOf(it) {
+  if (!it?.full_path) return '';
+  const i = it.full_path.lastIndexOf('/');
+  return i > 0 ? it.full_path.slice(0, i) : '';
+}
+function fmtStats(st, hasPoly) {
+  const parts = [];
+  if (st.verts) parts.push(`${st.verts.toLocaleString()} verts`);
+  if (st.quads) parts.push(`${st.quads.toLocaleString()} quads`);
+  if (st.tris) parts.push(`${st.tris.toLocaleString()} tris`);
+  if (st.ngons) parts.push(`${st.ngons.toLocaleString()} ngons`);
+  if (st.poles) parts.push(`${st.poles.toLocaleString()} poles`);
+  if (!st.quads && !st.tris && st.faces) parts.push(`${st.faces.toLocaleString()} faces`);
+  return parts.join(' \u00b7 ') + (hasPoly ? ' \u00b7 poly edges' : '');
+}
+
+// --- Listing ---
+async function fetchList(reset = true) {
+  if (loading) return;
+  loading = true;
+  const offset = reset ? 0 : state.items.length;
+  const qs = new URLSearchParams({
+    kind: state.kind, root: state.root, q: state.q, offset: String(offset), limit: '24',
+    project: state.activeProject, active_convo: state.activeConvo,
+  });
+  try {
+    const r = await apiFetch('/api/list?' + qs.toString());
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    state.counts = data.counts || {};
+    state.roots = data.roots || [];
+    state.mutedDirs = data.muted_dirs || [];
+    state.recent = data.recent || [];
+    state.convos = data.conversations || [];
+    if (typeof data.auto_follow_dirs === 'boolean') {
+      state.autoFollowDirs = data.auto_follow_dirs;
+      $('#btnAuto').classList.toggle('on', state.autoFollowDirs);
+    }
+    if (typeof data.scope_by_project === 'boolean') {
+      state.scopeByProject = data.scope_by_project;
+    }
+    if (!state.activeProject && data.resolved_project) state.activeProject = data.resolved_project;
+    if (data.resolved_project_name) state.activeProjectName = data.resolved_project_name;
+    updateScopeButton();
+    state.more = !!data.more;
+    state.total = data.total || 0;
+    state.items = reset ? data.items : state.items.concat(data.items);
+    renderTabs();
+    renderRoots();
+    renderGrid(reset);
+  } catch (err) {
+    const empty = $('#empty');
+    empty.style.display = 'block';
+    empty.textContent = `Could not load Live Gallery stream (${err?.message || err}). Retrying...`;
+  } finally {
+    loading = false;
+  }
+}
+
+function renderTabs() {
+  $('#tabs').innerHTML = TABS.map(([k, label]) => {
+    const c = state.counts[k] ?? 0;
+    return `<button class="tab ${state.kind === k ? 'on' : ''}" data-kind="${k}">${label}<span class="cnt">${c}</span></button>`;
+  }).join('');
+}
+
+function renderRoots() {
+  const el = $('#rootsBar');
+  const rootChips = state.roots.map(r => `
+    <div class="chip ${state.root === r.path ? 'on' : ''}" data-root="${esc(r.path)}" title="${esc(r.path)}${r.auto ? ' (auto-followed from agent writes)' : ''}">
+      ${r.auto ? '<span class="adot" title="Auto-followed"></span>' : ''}
+      <span>${esc(r.name)}</span>
+      <span class="x" data-rm="${esc(r.path)}">&times;</span>
+    </div>
+  `);
+  const mutedChips = (state.mutedDirs || []).map(d => {
+    const nm = d.replace(/\/+$/, '').split('/').pop() || d;
+    return `<div class="chip muted-chip" title="Muted folder: ${esc(d)} — click × to unmute"><span>muted: ${esc(nm)}</span><span class="x" data-unmute="${esc(d)}">&times;</span></div>`;
+  });
+  if (!rootChips.length && !mutedChips.length) {
+    el.innerHTML = '<span style="font-size:11px;color:var(--muted)">Watching Antigravity brain &amp; artifacts · agent-written folders are picked up automatically</span>';
+    return;
+  }
+  el.innerHTML = rootChips.join('') + mutedChips.join('');
+}
+
+async function toggleStarItem(it, btnEl) {
+  const r = await apiFetch('/api/star', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: it.id, starred: !it.starred }),
+  });
+  const d = await r.json();
+  if (d.ok) {
+    it.starred = d.starred;
+    if (btnEl) {
+      btnEl.classList.toggle('starred', it.starred);
+      btnEl.classList.toggle('star-on', it.starred);
+      btnEl.innerHTML = it.starred ? '&#9733;' : '&#9734;';
+    }
+    fetchList(true);
+  }
+}
+
+function setCompareA(it) {
+  compareA = it;
+  $('#cmpTrayName').textContent = it ? it.name : '';
+  $('#cmpTray').classList.toggle('show', !!it);
+  renderGrid(true);
+}
+
+function cardNode(it, idx) {
+  const div = document.createElement('div');
+  const mark = marks.get(it.id);
+  const isA = compareA && compareA.id === it.id;
+  div.className = 'card' + (mark === 'new' ? ' is-new' : mark === 'upd' ? ' is-upd' : '') + (isA ? ' cmp-a' : '');
+  div.dataset.idx = String(idx);
+  const badge = mark === 'new' ? '<span class="pill new">NEW</span>'
+    : mark === 'upd' ? '<span class="pill upd">UPD</span>' : '';
+  const typeLabel = it.kind === 'model' ? `3D \u00b7 ${it.ext}` : it.kind === 'agent' ? 'AGENT' : (it.ext || it.kind);
+
+  let thumbHtml = '';
+  const fUrl = `/f/${it.id}?v=${it.mtime}`;
+  if (it.kind === 'image') {
+    thumbHtml = `<img loading="lazy" decoding="async" src="${fUrl}" alt="${esc(it.name)}">`;
+  } else if (it.kind === 'model') {
+    const tSrc = it.has_thumb ? `/t/${it.tkey}` : '';
+    thumbHtml = `<img class="m3d" loading="lazy" decoding="async" ${tSrc ? `src="${tSrc}"` : ''} alt="${esc(it.name)}">`;
+  } else if (it.kind === 'video') {
+    thumbHtml = `<video muted loop playsinline preload="none" data-src="${fUrl}"></video><div class="pdf-box" style="position:absolute;pointer-events:none"><div>&#9654;</div><small>${esc(it.ext.toUpperCase())}</small></div>`;
+  } else if (it.kind === 'audio') {
+    thumbHtml = `<div class="audio-box"><div>&#9835; ${esc(it.ext.toUpperCase())}</div><audio controls preload="none" src="${fUrl}"></audio></div>`;
+  } else if (it.kind === 'text' && it.ext === 'pdf') {
+    thumbHtml = `<div class="pdf-box"><div>PDF</div><small>${esc(fmtSize(it.size))}</small></div>`;
+  } else if (it.kind === 'agent') {
+    thumbHtml = `<div class="agent-preview">${esc(it.snippet)}</div>`;
+  } else {
+    thumbHtml = `<pre>${esc(it.snippet || '(empty)')}</pre>`;
+  }
+
+  const attrLine = it.convo
+    ? `<div class="attr">${esc(it.model ? `${it.model} \u00b7 ` : '')}${esc(it.tool ? `${it.tool} \u00b7 ` : '')}${esc(it.convo.slice(0, 8))}</div>`
+    : '';
+
+  const isMedia = it.kind === 'image' || it.kind === 'model' || it.kind === 'video';
+  div.innerHTML = `
+    <div class="thumb ${isMedia ? 'media' : ''} ${it.kind === 'model' ? 'contain' : ''}">
+      ${thumbHtml}
+      <span class="pill">${esc(typeLabel)}</span>
+      ${badge}
+      <div class="card-acts ${it.starred || isA ? 'pinned' : ''}">
+        <button class="cbtn ${it.starred ? 'starred' : ''}" data-act="star" title="Star">${it.starred ? '&#9733;' : '&#9734;'}</button>
+        <button class="cbtn" data-act="cmp" title="${compareA ? 'Compare with A' : 'Pin as A for compare'}">${isA ? 'A' : 'A/B'}</button>
+      </div>
+    </div>
+    <div class="meta">
+      <div class="name" title="${esc(it.rel || it.name)}">${esc(it.name)}</div>
+      <div class="sub"><span title="${esc(it.rel)}">${esc(it.root_name)}</span><span>${esc(relTime(it.mtime))}</span></div>
+      ${attrLine}
+    </div>
+  `;
+
+  if (it.kind === 'model' && !it.has_thumb) observeThumb(div, it, div.querySelector('img.m3d'));
+  if (it.kind === 'video') {
+    const vid = div.querySelector('video');
+    div.addEventListener('mouseenter', () => { if (!vid.src && vid.dataset.src) vid.src = vid.dataset.src; vid.play().catch(() => {}); });
+    div.addEventListener('mouseleave', () => { vid.pause(); vid.removeAttribute('src'); vid.load(); });
+  }
+  div.addEventListener('click', e => {
+    const act = e.target.closest('[data-act]');
+    if (act) {
+      e.stopPropagation();
+      if (act.dataset.act === 'star') toggleStarItem(it, act);
+      else if (act.dataset.act === 'cmp') {
+        if (compareA && compareA.id !== it.id) { const a = compareA; setCompareA(null); openCompare(a, it); }
+        else if (compareA && compareA.id === it.id) setCompareA(null);
+        else setCompareA(it);
+      }
+      return;
+    }
+    if (e.target.closest('audio')) return;
+    if (compareA && compareA.id !== it.id) {
+      const a = compareA; setCompareA(null); openCompare(a, it);
+      return;
+    }
+    openModal(idx);
+  });
+  return div;
+}
+
+function stackCardNode(groupKey, folderName, members) {
+  const div = document.createElement('div');
+  div.className = 'card stack-card';
+  const cells = members.slice(0, 4).map(({ it }) => {
+    if (it.kind === 'image') return `<div class="st-cell"><img loading="lazy" src="/f/${it.id}?v=${it.mtime}"></div>`;
+    if (it.kind === 'model' && it.has_thumb) return `<div class="st-cell"><img loading="lazy" src="/t/${it.tkey}"></div>`;
+    return `<div class="st-cell">${esc((it.ext || it.kind).toUpperCase())}</div>`;
+  }).join('');
+  div.innerHTML = `
+    <div class="thumb media">
+      <div class="stack-thumbs">${cells}</div>
+      <span class="pill">BATCH \u00b7 ${members.length}</span>
+    </div>
+    <div class="meta">
+      <div class="name">${esc(folderName)}</div>
+      <div class="sub"><span>Click to expand ${members.length} outputs</span><span>${esc(relTime(members[0].it.mtime))}</span></div>
+    </div>
+  `;
+  div.addEventListener('click', () => {
+    state.expandedGroups.add(groupKey);
+    renderGrid(true);
+  });
+  return div;
+}
+
+function renderGrid(reset) {
+  const grid = $('#grid');
+  const empty = $('#empty');
+  if (reset || state.groupBursts) grid.innerHTML = '';
+  empty.style.display = state.items.length ? 'none' : 'block';
+  const frag = document.createDocumentFragment();
+
+  if (state.groupBursts) {
+    let i = 0;
+    while (i < state.items.length) {
+      const dir = parentDirOf(state.items[i]);
+      let j = i + 1;
+      while (dir && j < state.items.length && parentDirOf(state.items[j]) === dir) j++;
+      const runLen = j - i;
+      const gKey = `${dir}:${state.items[i].id}`;
+      if (dir && runLen >= 4 && !state.expandedGroups.has(gKey)) {
+        const fname = dir.split('/').pop() || dir;
+        const members = [];
+        for (let k = i; k < j; k++) members.push({ it: state.items[k], idx: k });
+        frag.appendChild(stackCardNode(gKey, fname, members));
+      } else {
+        for (let k = i; k < j; k++) frag.appendChild(cardNode(state.items[k], k));
+      }
+      i = j;
+    }
+  } else {
+    const start = reset ? 0 : grid.children.length;
+    for (let i = start; i < state.items.length; i++) frag.appendChild(cardNode(state.items[i], i));
+  }
+  grid.appendChild(frag);
+}
+
+// --- 3D preferences & camera lock ---
+let activeZoom = null;
+let active3D = null;
+let activeAnnoCleanup = null;
+let lockedCameraState = null;
+let prefs3D = (() => {
+  try {
+    const s = JSON.parse(localStorage.getItem('lg-3d-prefs') || '{}');
+    return {
+      mode: s.mode || 'shaded', ao: !!s.ao, lines: !!s.lines, wire: !!s.wire,
+      topo: !!s.topo, back: !!s.back, lockCam: !!s.lockCam, spin: !!s.spin, grid: !!s.grid,
+    };
+  } catch {
+    return { mode: 'shaded', ao: false, lines: false, wire: false, topo: false, back: false, lockCam: false, spin: false, grid: false };
+  }
+})();
+function save3DPrefs() { try { localStorage.setItem('lg-3d-prefs', JSON.stringify(prefs3D)); } catch {} }
+function sync3DBar(barSel = '#m3dBar') {
+  const bar = $(barSel);
+  if (!bar) return;
+  bar.querySelectorAll('[data-m3d]').forEach(b => b.classList.toggle('on', b.dataset.m3d === prefs3D.mode));
+  if (barSel === '#m3dBar') {
+    $('#b3dAO').classList.toggle('on', prefs3D.ao || prefs3D.mode === 'ao');
+    $('#b3dLines').classList.toggle('on', prefs3D.lines);
+    $('#b3dWire').classList.toggle('on', prefs3D.wire);
+    $('#b3dTopo').classList.toggle('on', prefs3D.topo);
+    $('#b3dBack').classList.toggle('on', prefs3D.back);
+    $('#b3dCam').classList.toggle('on', prefs3D.lockCam);
+    $('#b3dSpin').classList.toggle('on', prefs3D.spin);
+    $('#b3dGrid').classList.toggle('on', prefs3D.grid);
+  } else {
+    bar.querySelectorAll('[data-t3d]').forEach(b => {
+      const k = b.dataset.t3d;
+      b.classList.toggle('on', k === 'ao' ? (prefs3D.ao || prefs3D.mode === 'ao') : !!prefs3D[k]);
+    });
+  }
+}
+function apply3DPrefs(patch) {
+  prefs3D = { ...prefs3D, ...patch };
+  save3DPrefs();
+  sync3DBar('#m3dBar');
+  sync3DBar('#cmp3dBar');
+  if (active3D) active3D.setState(prefs3D);
+  if (activeCmp3D) activeCmp3D.setState(prefs3D);
+}
+
+// --- Pan & Zoom helper ---
+function attachPanZoom(body, el, isVideo = false) {
+  el.draggable = false;
+  let scale = 1, tx = 0, ty = 0, drag = null, moved = false;
+  const updateReadout = () => {
+    $('#zPct').textContent = Math.abs(scale - 1) < 0.01 && !tx && !ty ? 'Fit' : `${Math.round(scale * 100)}%`;
+  };
+  const apply = () => { el.style.transform = `translate(${tx}px,${ty}px) scale(${scale})`; updateReadout(); };
+  const resetFit = () => { scale = 1; tx = 0; ty = 0; apply(); };
+  const setNative100 = () => {
+    const nw = el.naturalWidth || el.videoWidth || 0, baseW = el.clientWidth || 0;
+    scale = (nw && baseW) ? Math.min(16, Math.max(0.25, nw / baseW)) : 2;
+    tx = 0; ty = 0; apply();
+  };
+  const zoomAt = (factor, clientX, clientY) => {
+    const rect = body.getBoundingClientRect();
+    const cx = clientX - (rect.left + rect.width / 2), cy = clientY - (rect.top + rect.height / 2);
+    const next = Math.min(16, Math.max(0.25, scale * factor));
+    const ratio = next / scale;
+    tx = cx - (cx - tx) * ratio; ty = cy - (cy - ty) * ratio; scale = next; apply();
+  };
+  body.classList.add('pz'); $('#mZoom').classList.add('show'); updateReadout();
+  const onWheel = e => { e.preventDefault(); const step = e.ctrlKey ? 1.08 : 1.18; zoomAt(e.deltaY < 0 ? step : 1 / step, e.clientX, e.clientY); };
+  const onDown = e => {
+    if (e.button !== 0) return;
+    if (isVideo && e.clientY > el.getBoundingClientRect().bottom - 48) return;
+    e.preventDefault();
+    drag = { id: e.pointerId, sx: e.clientX, sy: e.clientY, ox: tx, oy: ty };
+    moved = false; body.classList.add('grabbing');
+    try { body.setPointerCapture(e.pointerId); } catch {}
+  };
+  const onMove = e => {
+    if (!drag || e.pointerId !== drag.id) return;
+    const dx = e.clientX - drag.sx, dy = e.clientY - drag.sy;
+    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) moved = true;
+    tx = drag.ox + dx; ty = drag.oy + dy; apply();
+  };
+  const onUp = e => {
+    if (!drag || e.pointerId !== drag.id) return;
+    const bgClick = !moved && e.target === body;
+    drag = null; body.classList.remove('grabbing');
+    try { body.releasePointerCapture(e.pointerId); } catch {}
+    if (bgClick) closeModal();
+  };
+  const onDbl = e => { if (isVideo) return; e.preventDefault(); if (Math.abs(scale - 1) < 0.05) setNative100(); else resetFit(); };
+  body.addEventListener('wheel', onWheel, { passive: false });
+  body.addEventListener('pointerdown', onDown);
+  body.addEventListener('pointermove', onMove);
+  body.addEventListener('pointerup', onUp);
+  body.addEventListener('pointercancel', onUp);
+  el.addEventListener('dblclick', onDbl);
+  activeZoom = {
+    zoomIn: () => { const r = body.getBoundingClientRect(); zoomAt(1.3, r.left + r.width / 2, r.top + r.height / 2); },
+    zoomOut: () => { const r = body.getBoundingClientRect(); zoomAt(1 / 1.3, r.left + r.width / 2, r.top + r.height / 2); },
+    fit: resetFit, oneToOne: setNative100,
+  };
+  return () => {
+    activeZoom = null; $('#mZoom').classList.remove('show'); body.classList.remove('pz', 'grabbing');
+    body.removeEventListener('wheel', onWheel); body.removeEventListener('pointerdown', onDown);
+    body.removeEventListener('pointermove', onMove); body.removeEventListener('pointerup', onUp);
+    body.removeEventListener('pointercancel', onUp); el.removeEventListener('dblclick', onDbl);
+  };
+}
+
+// --- Redline Annotation overlay (works on images & 3D snapshots!) ---
+let annoTool = 'pen', annoColor = '#ef4444';
+function startAnnotation() {
+  const it = state.openItem;
+  if (!it) return;
+  let sourceUrl = null;
+  if (it.kind === 'model' && active3D) {
+    sourceUrl = active3D.capturePNG();
+  } else if (it.kind === 'image') {
+    const img = $('#mBody img');
+    if (img) sourceUrl = img.src;
+  }
+  if (!sourceUrl) return;
+
+  const imgObj = new Image();
+  imgObj.crossOrigin = 'anonymous';
+  imgObj.onload = () => {
+    if (active3D && prefs3D.lockCam) lockedCameraState = active3D.getCameraState();
+    closeViewerCleanup();
+    const body = $('#mBody');
+    body.innerHTML = '';
+    const wrap = document.createElement('div');
+    wrap.className = 'anno-wrap';
+    const canvas = document.createElement('canvas');
+    const maxW = 1400;
+    const scale = imgObj.naturalWidth > maxW ? maxW / imgObj.naturalWidth : 1;
+    canvas.width = Math.max(1, Math.round(imgObj.naturalWidth * scale));
+    canvas.height = Math.max(1, Math.round(imgObj.naturalHeight * scale));
+    wrap.appendChild(canvas);
+    body.appendChild(wrap);
+    $('#mAnnoBar').classList.add('show');
+
+    const ctx = canvas.getContext('2d');
+    const strokes = [];
+    let cur = null;
+
+    function drawArrow(c, x1, y1, x2, y2, color, lw) {
+      c.strokeStyle = color; c.fillStyle = color; c.lineWidth = lw; c.lineCap = 'round';
+      c.beginPath(); c.moveTo(x1, y1); c.lineTo(x2, y2); c.stroke();
+      const ang = Math.atan2(y2 - y1, x2 - x1), hl = Math.max(12, lw * 3.5);
+      c.beginPath();
+      c.moveTo(x2, y2);
+      c.lineTo(x2 - hl * Math.cos(ang - 0.45), y2 - hl * Math.sin(ang - 0.45));
+      c.lineTo(x2 - hl * Math.cos(ang + 0.45), y2 - hl * Math.sin(ang + 0.45));
+      c.closePath(); c.fill();
+    }
+
+    function redraw() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(imgObj, 0, 0, canvas.width, canvas.height);
+      const lw = Math.max(3, Math.round(canvas.width / 220));
+      for (const s of cur ? strokes.concat([cur]) : strokes) {
+        ctx.strokeStyle = s.color; ctx.lineWidth = lw; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+        if (s.tool === 'pen' && s.pts.length) {
+          ctx.beginPath();
+          ctx.moveTo(s.pts[0][0], s.pts[0][1]);
+          for (let i = 1; i < s.pts.length; i++) ctx.lineTo(s.pts[i][0], s.pts[i][1]);
+          ctx.stroke();
+        } else if (s.tool === 'arrow') {
+          drawArrow(ctx, s.x1, s.y1, s.x2, s.y2, s.color, lw);
+        } else if (s.tool === 'rect') {
+          ctx.strokeRect(s.x1, s.y1, s.x2 - s.x1, s.y2 - s.y1);
+        }
+      }
+    }
+    redraw();
+
+    const toPt = e => {
+      const r = canvas.getBoundingClientRect();
+      return [(e.clientX - r.left) * (canvas.width / r.width), (e.clientY - r.top) * (canvas.height / r.height)];
+    };
+    canvas.onpointerdown = e => {
+      e.preventDefault(); canvas.setPointerCapture(e.pointerId);
+      const [x, y] = toPt(e);
+      if (annoTool === 'pen') cur = { tool: 'pen', color: annoColor, pts: [[x, y]] };
+      else cur = { tool: annoTool, color: annoColor, x1: x, y1: y, x2: x, y2: y };
+      redraw();
+    };
+    canvas.onpointermove = e => {
+      if (!cur) return;
+      const [x, y] = toPt(e);
+      if (cur.tool === 'pen') cur.pts.push([x, y]);
+      else { cur.x2 = x; cur.y2 = y; }
+      redraw();
+    };
+    canvas.onpointerup = () => { if (cur) { strokes.push(cur); cur = null; redraw(); } };
+
+    $('#aUndo').onclick = () => { strokes.pop(); redraw(); };
+    $('#aClear').onclick = () => { strokes.length = 0; redraw(); };
+    $('#aCancel').onclick = () => { openModalItem(it, state.openIdx); };
+    $('#aSend').onclick = async () => {
+      $('#replyStatus').textContent = 'Saving annotation...';
+      const note = $('#replyInput').value.trim();
+      const dataUrl = canvas.toDataURL('image/png');
+      const useHostSend = !!(window.sidecar?.agent?.sendMessage);
+      try {
+        const r = await apiFetch('/api/annotate', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            image_data_url: dataUrl, convo: it.convo || state.activeConvo || '',
+            item_id: it.id, note, send: !useHostSend,
+          }),
+        });
+        const res = await r.json();
+        if (!res.ok) { $('#replyStatus').textContent = res.error || 'Failed'; return; }
+        if (useHostSend) await window.sidecar.agent.sendMessage(res.prompt);
+        $('#replyInput').value = '';
+        $('#replyStatus').textContent = 'Annotated screenshot sent!';
+        openModalItem(it, state.openIdx);
+      } catch { $('#replyStatus').textContent = 'Failed to send'; }
+    };
+
+    activeAnnoCleanup = () => {
+      $('#mAnnoBar').classList.remove('show');
+      activeAnnoCleanup = null;
+    };
+    viewerCleanup = activeAnnoCleanup;
+  };
+  imgObj.src = sourceUrl;
+}
+
+// --- Modal rendering (supports revisions + code diffs!) ---
+function renderDiffHtml(diffText) {
+  return diffText.split('\n').map(line => {
+    let cls = 'diff-line';
+    if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('@@')) cls += ' diff-hdr';
+    else if (line.startsWith('+')) cls += ' diff-add';
+    else if (line.startsWith('-')) cls += ' diff-del';
+    return `<span class="${cls}">${esc(line)}</span>`;
+  }).join('');
+}
+
+async function renderModalBody(it, overrideUrl = null) {
+  if (active3D && prefs3D.lockCam) lockedCameraState = active3D.getCameraState();
+  closeViewerCleanup();
+  const body = $('#mBody');
+  body.innerHTML = '';
+  const fUrl = overrideUrl || `/f/${it.id}?v=${it.mtime}`;
+
+  if (it.kind === 'image') {
+    const img = document.createElement('img');
+    img.src = fUrl;
+    body.appendChild(img);
+    viewerCleanup = attachPanZoom(body, img, false);
+  } else if (it.kind === 'video') {
+    const v = document.createElement('video');
+    v.src = fUrl; v.controls = true; v.autoplay = true;
+    body.appendChild(v);
+    const pzClean = attachPanZoom(body, v, true);
+    viewerCleanup = () => { pzClean(); v.pause(); v.src = ''; };
+  } else if (it.kind === 'audio') {
+    const a = document.createElement('audio');
+    a.src = fUrl; a.controls = true; a.autoplay = true;
+    body.appendChild(a);
+    viewerCleanup = () => { a.pause(); a.src = ''; };
+  } else if (it.kind === 'model') {
+    body.innerHTML = '<div style="color:var(--muted)">Loading 3D model...</div>';
+    try {
+      const { createViewer } = await getKit();
+      if (state.openItem !== it) return;
+      body.innerHTML = '';
+      const canvas = document.createElement('canvas');
+      canvas.className = 'view3d';
+      body.appendChild(canvas);
+      const camInit = prefs3D.lockCam ? lockedCameraState : null;
+      const viewer = await createViewer(canvas, body, fUrl, it.ext, prefs3D, camInit);
+      if (state.openItem !== it) { viewer.destroy(); return; }
+      active3D = viewer;
+      $('#m3dBar').classList.add('show');
+      sync3DBar('#m3dBar');
+      const stText = fmtStats(viewer.stats || {}, viewer.hasPolyLines);
+      if (stText) {
+        const pill = document.createElement('div');
+        pill.className = 'm-stats';
+        pill.textContent = stText;
+        body.appendChild(pill);
+      }
+      viewerCleanup = () => {
+        if (prefs3D.lockCam) lockedCameraState = viewer.getCameraState();
+        active3D = null;
+        $('#m3dBar').classList.remove('show');
+        viewer.destroy();
+      };
+    } catch (err) {
+      body.innerHTML = `<div style="color:#f87171">Failed to load 3D model: ${esc(err?.message || err)}</div>`;
+    }
+  } else if (it.kind === 'text' && it.ext === 'pdf') {
+    const iframe = document.createElement('iframe');
+    iframe.src = fUrl;
+    body.appendChild(iframe);
+  } else {
+    const pre = document.createElement('pre');
+    pre.className = 'm-text' + (it.kind === 'agent' ? ' prose' : '');
+    pre.textContent = 'Loading...';
+    body.appendChild(pre);
+    if (it.kind === 'code' && !overrideUrl) {
+      try {
+        const [tr, dr] = await Promise.all([
+          apiFetch(`/api/text?id=${encodeURIComponent(it.id)}`).then(r => r.json()),
+          apiFetch(`/api/diff?id=${encodeURIComponent(it.id)}`).then(r => r.json()).catch(() => ({ diff: '' })),
+        ]);
+        const srcText = (tr.text || '(empty)') + (tr.truncated ? '\n\n--- [truncated at 256 KB] ---' : '');
+        const hasDiff = !!(dr.diff && dr.diff.trim());
+        const showDiff = () => {
+          $('#bDiffView').classList.add('on'); $('#bSrcView').classList.remove('on');
+          pre.innerHTML = renderDiffHtml(dr.diff);
+        };
+        const showSrc = () => {
+          $('#bSrcView').classList.add('on'); $('#bDiffView').classList.remove('on');
+          pre.textContent = srcText;
+        };
+        if (hasDiff) {
+          $('#mDiffBar').classList.add('show');
+          $('#diffMeta').textContent = dr.source === 'git' ? 'git diff' : 'last agent edit';
+          $('#bDiffView').onclick = showDiff;
+          $('#bSrcView').onclick = showSrc;
+          showDiff();
+        } else {
+          $('#mDiffBar').classList.remove('show');
+          pre.textContent = srcText;
+        }
+        viewerCleanup = () => { $('#mDiffBar').classList.remove('show'); };
+      } catch { pre.textContent = '(failed to load)'; }
+    } else {
+      try {
+        const txt = overrideUrl
+          ? await apiFetch(overrideUrl).then(r => r.text())
+          : await apiFetch(`/api/text?id=${encodeURIComponent(it.id)}`).then(r => r.json()).then(d => (d.text || '(empty)') + (d.truncated ? '\n\n--- [truncated at 256 KB] ---' : ''));
+        pre.textContent = txt;
+      } catch { pre.textContent = '(failed to load)'; }
+    }
+  }
+}
+
+async function loadRevisionsBar(it) {
+  const bar = $('#mRevBar');
+  bar.classList.remove('show');
+  bar.innerHTML = '';
+  if (!it.full_path || it.kind === 'agent') return;
+  try {
+    const r = await apiFetch(`/api/revisions?id=${encodeURIComponent(it.id)}`);
+    const d = await r.json();
+    const revs = d.revisions || [];
+    if (revs.length < 2) return;
+    bar.innerHTML = `<span style="font-size:11px;color:var(--muted)">Revisions:</span>` +
+      revs.map((rv, i) => `<button class="btn" data-rev="${esc(rv.url)}" title="${new Date(rv.mtime * 1000).toLocaleTimeString()}">v${i + 1}</button>`).join('') +
+      `<button class="btn on" data-rev="latest">Latest</button>` +
+      `<span class="sep"></span><button class="btn" id="revCmpFirst">Compare v1 vs Latest</button>`;
+    bar.classList.add('show');
+    bar.onclick = e => {
+      if (e.target.id === 'revCmpFirst') {
+        const revA = { ...it, name: `${it.name} (v1)`, _overrideUrl: revs[0].url };
+        const revB = { ...it, name: `${it.name} (Latest)` };
+        closeModal();
+        openCompare(revA, revB);
+        return;
+      }
+      const b = e.target.closest('[data-rev]');
+      if (!b) return;
+      bar.querySelectorAll('[data-rev]').forEach(x => x.classList.toggle('on', x === b));
+      renderModalBody(it, b.dataset.rev === 'latest' ? null : b.dataset.rev);
+    };
+  } catch {}
+}
+
+function openModal(idx) {
+  if (idx < 0 || idx >= state.items.length) return;
+  openModalItem(state.items[idx], idx);
+}
+
+async function openModalItem(it, idx) {
+  state.openIdx = idx;
+  state.openItem = it;
+  $('#mName').textContent = it.name;
+  $('#mSub').textContent = it.full_path || `${it.root_name} \u00b7 ${it.rel}`;
+  $('#mCopy').style.display = it.full_path ? '' : 'none';
+  $('#mAnno').style.display = (it.kind === 'image' || it.kind === 'model') ? '' : 'none';
+  $('#mMute').style.display = (it.source === 'workspace' && parentDirOf(it)) ? '' : 'none';
+  $('#mStar').innerHTML = it.starred ? '&#9733;' : '&#9734;';
+  $('#mStar').classList.toggle('star-on', !!it.starred);
+  $('#mPrev').style.display = idx >= 0 ? '' : 'none';
+  $('#mNext').style.display = idx >= 0 ? '' : 'none';
+  $('#replyStatus').textContent = '';
+  $('#modal').classList.add('open');
+  renderModalBody(it);
+  loadRevisionsBar(it);
+}
+
+function closeViewerCleanup() {
+  if (viewerCleanup) { try { viewerCleanup(); } catch {} viewerCleanup = null; }
+}
+function closeModal() {
+  closeViewerCleanup();
+  $('#mRevBar').classList.remove('show');
+  $('#mDiffBar').classList.remove('show');
+  $('#modal').classList.remove('open');
+  state.openIdx = -1;
+  state.openItem = null;
+}
+
+// --- A/B Side-by-Side Compare Modal ---
+let activeCmp3D = null;
+let cmpImageMode = 'wipe';
+
+function closeCompare() {
+  if (compareCleanup) { try { compareCleanup(); } catch {} compareCleanup = null; }
+  activeCmp3D = null;
+  $('#cmp3dBar').classList.remove('show');
+  $('#cmpModeWipe').style.display = 'none';
+  $('#cmpModeSide').style.display = 'none';
+  $('#cmpModal').classList.remove('open');
+}
+
+async function openCompare(itemA, itemB) {
+  closeCompare();
+  $('#cmpTitle').textContent = `A: ${itemA.name}   vs   B: ${itemB.name}`;
+  $('#cmpSub').textContent = `${itemA.rel || itemA.name}  |  ${itemB.rel || itemB.name}`;
+  $('#cmpModal').classList.add('open');
+  const body = $('#cmpBody');
+  body.innerHTML = '';
+  const urlA = itemA._overrideUrl || `/f/${itemA.id}?v=${itemA.mtime}`;
+  const urlB = itemB._overrideUrl || `/f/${itemB.id}?v=${itemB.mtime}`;
+
+  if (itemA.kind === 'model' && itemB.kind === 'model') {
+    $('#cmp3dBar').classList.add('show');
+    sync3DBar('#cmp3dBar');
+    body.innerHTML = `
+      <div class="cmp-split">
+        <div class="cmp-pane" id="cmpPaneA"><span class="cmp-lbl">A: ${esc(itemA.name)}</span><canvas id="cmpCanA"></canvas></div>
+        <div class="cmp-pane" id="cmpPaneB"><span class="cmp-lbl">B: ${esc(itemB.name)}</span><canvas id="cmpCanB"></canvas></div>
+      </div>
+    `;
+    try {
+      const { createCompareViewer } = await getKit();
+      const cv = await createCompareViewer(
+        $('#cmpCanA'), $('#cmpPaneA'), urlA, itemA.ext,
+        $('#cmpCanB'), $('#cmpPaneB'), urlB, itemB.ext,
+        prefs3D
+      );
+      activeCmp3D = cv;
+      const addStat = (pane, v) => {
+        const t = fmtStats(v.stats || {}, v.hasPolyLines);
+        if (t) { const d = document.createElement('div'); d.className = 'm-stats'; d.textContent = t; pane.appendChild(d); }
+      };
+      addStat($('#cmpPaneA'), cv.vA);
+      addStat($('#cmpPaneB'), cv.vB);
+      $('#cmpReset').onclick = () => cv.reset();
+      compareCleanup = () => cv.destroy();
+    } catch (err) {
+      body.innerHTML = `<div style="color:#f87171">3D compare failed: ${esc(err?.message || err)}</div>`;
+    }
+    return;
+  }
+
+  if (itemA.kind === 'image' && itemB.kind === 'image') {
+    $('#cmpModeWipe').style.display = '';
+    $('#cmpModeSide').style.display = '';
+    let scale = 1, tx = 0, ty = 0, split = 0.5;
+    let imgEls = [];
+
+    const applyXform = () => {
+      const tf = `translate(${tx}px,${ty}px) scale(${scale})`;
+      for (const el of imgEls) el.style.transform = tf;
+    };
+    const renderImgCmp = () => {
+      $('#cmpModeWipe').classList.toggle('on', cmpImageMode === 'wipe');
+      $('#cmpModeSide').classList.toggle('on', cmpImageMode === 'side');
+      if (cmpImageMode === 'wipe') {
+        body.innerHTML = `
+          <div class="cmp-wipe" id="cmpWipe">
+            <div class="layer"><img id="cmpImgB" src="${urlB}"></div>
+            <div class="layer" id="cmpClipA"><img id="cmpImgA" src="${urlA}"></div>
+            <div class="cmp-handle" id="cmpHandle"></div>
+            <span class="cmp-lbl" style="position:absolute;top:8px;left:8px;z-index:8;padding:2px 8px;border-radius:5px;background:var(--badge-bg);border:1px solid var(--line);font-size:11px">A: ${esc(itemA.name)}</span>
+            <span class="cmp-lbl" style="position:absolute;top:8px;right:8px;z-index:8;padding:2px 8px;border-radius:5px;background:var(--badge-bg);border:1px solid var(--line);font-size:11px">B: ${esc(itemB.name)}</span>
+          </div>
+        `;
+        imgEls = [$('#cmpImgA'), $('#cmpImgB')];
+        const updateSplit = () => {
+          const pct = Math.max(0.02, Math.min(0.98, split)) * 100;
+          $('#cmpClipA').style.clipPath = `inset(0 ${100 - pct}% 0 0)`;
+          $('#cmpHandle').style.left = `${pct}%`;
+        };
+        updateSplit();
+        let draggingSplit = false;
+        $('#cmpHandle').onpointerdown = e => { e.stopPropagation(); e.preventDefault(); draggingSplit = true; $('#cmpHandle').setPointerCapture(e.pointerId); };
+        $('#cmpHandle').onpointermove = e => {
+          if (!draggingSplit) return;
+          const r = $('#cmpWipe').getBoundingClientRect();
+          split = (e.clientX - r.left) / r.width;
+          updateSplit();
+        };
+        $('#cmpHandle').onpointerup = () => { draggingSplit = false; };
+      } else {
+        body.innerHTML = `
+          <div class="cmp-split">
+            <div class="cmp-pane"><span class="cmp-lbl">A: ${esc(itemA.name)}</span><img id="cmpImgA" src="${urlA}"></div>
+            <div class="cmp-pane"><span class="cmp-lbl">B: ${esc(itemB.name)}</span><img id="cmpImgB" src="${urlB}"></div>
+          </div>
+        `;
+        imgEls = [$('#cmpImgA'), $('#cmpImgB')];
+      }
+      applyXform();
+    };
+    renderImgCmp();
+
+    let drag = null;
+    const onWheel = e => {
+      e.preventDefault();
+      scale = Math.min(16, Math.max(0.25, scale * (e.deltaY < 0 ? 1.16 : 1 / 1.16)));
+      applyXform();
+    };
+    const onDown = e => {
+      if (e.target.id === 'cmpHandle' || e.button !== 0) return;
+      e.preventDefault();
+      drag = { sx: e.clientX, sy: e.clientY, ox: tx, oy: ty };
+    };
+    const onMove = e => { if (!drag) return; tx = drag.ox + (e.clientX - drag.sx); ty = drag.oy + (e.clientY - drag.sy); applyXform(); };
+    const onUp = () => { drag = null; };
+    body.addEventListener('wheel', onWheel, { passive: false });
+    body.addEventListener('pointerdown', onDown);
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    $('#cmpModeWipe').onclick = () => { cmpImageMode = 'wipe'; renderImgCmp(); };
+    $('#cmpModeSide').onclick = () => { cmpImageMode = 'side'; renderImgCmp(); };
+    $('#cmpReset').onclick = () => { scale = 1; tx = 0; ty = 0; split = 0.5; renderImgCmp(); };
+    compareCleanup = () => {
+      body.removeEventListener('wheel', onWheel);
+      body.removeEventListener('pointerdown', onDown);
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    };
+    return;
+  }
+
+  // Fallback side-by-side (code / text / mixed)
+  body.innerHTML = `
+    <div class="cmp-split">
+      <div class="cmp-pane"><span class="cmp-lbl">A: ${esc(itemA.name)}</span><pre class="m-text" id="cmpTxtA">Loading...</pre></div>
+      <div class="cmp-pane"><span class="cmp-lbl">B: ${esc(itemB.name)}</span><pre class="m-text" id="cmpTxtB">Loading...</pre></div>
+    </div>
+  `;
+  const loadOne = async (it, el) => {
+    try {
+      if (it._overrideUrl) el.textContent = await apiFetch(it._overrideUrl).then(r => r.text());
+      else el.textContent = (await apiFetch(`/api/text?id=${encodeURIComponent(it.id)}`).then(r => r.json())).text || '(empty)';
+    } catch { el.textContent = '(preview unavailable for this type)'; }
+  };
+  loadOne(itemA, $('#cmpTxtA'));
+  loadOne(itemB, $('#cmpTxtB'));
+  $('#cmpReset').onclick = () => {};
+}
+
+// --- Feedback send ---
+async function sendFeedback() {
+  const input = $('#replyInput');
+  const note = input.value.trim();
+  if (!note) return;
+  const it = state.openItem;
+  const ref = it ? (it.full_path ? `Regarding \`${it.rel}\` (${it.full_path}):\n` : `Regarding "${it.name}":\n`) : '';
+  const prompt = ref + note;
+  $('#replyStatus').textContent = 'Sending...';
+  try {
+    if (window.sidecar?.agent?.sendMessage) {
+      await window.sidecar.agent.sendMessage(prompt);
+      input.value = ''; $('#replyStatus').textContent = 'Sent!'; return;
+    }
+    const r = await apiFetch('/api/reply', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ convo: it?.convo || state.activeConvo || '', message: prompt }),
+    });
+    const res = await r.json();
+    if (res.ok) { input.value = ''; $('#replyStatus').textContent = 'Sent!'; }
+    else $('#replyStatus').textContent = res.error || 'Failed';
+  } catch { $('#replyStatus').textContent = 'Failed to send'; }
+}
+
+// --- Event wiring ---
+$('#tabs').addEventListener('click', e => {
+  const btn = e.target.closest('.tab');
+  if (!btn) return;
+  state.kind = btn.dataset.kind;
+  fetchList(true);
+});
+
+$('#rootsBar').addEventListener('click', async e => {
+  const unm = e.target.closest('[data-unmute]');
+  if (unm) {
+    e.stopPropagation();
+    await apiFetch('/api/mute', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ unmute: unm.dataset.unmute }) });
+    fetchList(true); return;
+  }
+  const rm = e.target.closest('[data-rm]');
+  if (rm) {
+    e.stopPropagation();
+    const p = rm.dataset.rm;
+    if (state.root === p) state.root = '';
+    await apiFetch('/api/watch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ remove: p }) });
+    fetchList(true); return;
+  }
+  const chip = e.target.closest('.chip[data-root]');
+  if (!chip) return;
+  state.root = state.root === chip.dataset.root ? '' : chip.dataset.root;
+  fetchList(true);
+});
+
+let searchTimer = 0;
+$('#search').addEventListener('input', e => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => { state.q = e.target.value; fetchList(true); }, 150);
+});
+
+$('#btnScope').addEventListener('click', async () => {
+  state.scopeByProject = !state.scopeByProject;
+  state.root = '';
+  updateScopeButton();
+  await apiFetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ scope_by_project: state.scopeByProject }) });
+  fetchList(true);
+});
+
+$('#btnAuto').addEventListener('click', async () => {
+  state.autoFollowDirs = !state.autoFollowDirs;
+  $('#btnAuto').classList.toggle('on', state.autoFollowDirs);
+  await apiFetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ auto_follow_dirs: state.autoFollowDirs }) });
+});
+
+$('#btnGroup').addEventListener('click', () => {
+  state.groupBursts = !state.groupBursts;
+  state.expandedGroups.clear();
+  $('#btnGroup').classList.toggle('on', state.groupBursts);
+  renderGrid(true);
+});
+
+$('#btnFollow').addEventListener('click', () => { state.follow = !state.follow; $('#btnFollow').classList.toggle('on', state.follow); });
+$('#btnPause').addEventListener('click', () => {
+  state.paused = !state.paused; $('#btnPause').classList.toggle('on', state.paused);
+  if (!state.paused && state.queued) { state.queued = 0; $('#banner').classList.remove('show'); fetchList(true); }
+});
+$('#btnAdd').addEventListener('click', () => { $('#addBox').classList.toggle('open'); if ($('#addBox').classList.contains('open')) $('#addInput').focus(); });
+$('#cmpTrayCancel').addEventListener('click', () => setCompareA(null));
+
+async function submitAddFolder() {
+  const val = $('#addInput').value.trim();
+  if (!val) return;
+  const r = await apiFetch('/api/watch', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ add: val, project: state.activeProject || undefined }),
+  });
+  const d = await r.json();
+  if (d.ok) { $('#addInput').value = ''; $('#ac').classList.remove('open'); $('#addBox').classList.remove('open'); fetchList(true); }
+  else alert(d.error || 'Could not watch folder');
+}
+$('#addGo').addEventListener('click', submitAddFolder);
+$('#addInput').addEventListener('keydown', e => { if (e.key === 'Enter') submitAddFolder(); });
+$('#addInput').addEventListener('input', async e => {
+  const v = e.target.value.trim();
+  if (!v) { $('#ac').classList.remove('open'); return; }
+  const r = await apiFetch('/api/dirs?prefix=' + encodeURIComponent(v));
+  const d = await r.json();
+  const ac = $('#ac');
+  if (!d.dirs || !d.dirs.length) { ac.classList.remove('open'); return; }
+  ac.innerHTML = d.dirs.map(p => `<div data-p="${esc(p)}">${esc(p)}</div>`).join('');
+  ac.classList.add('open');
+});
+$('#ac').addEventListener('click', e => {
+  const d = e.target.closest('[data-p]'); if (!d) return;
+  $('#addInput').value = d.dataset.p; $('#ac').classList.remove('open'); $('#addInput').focus();
+});
+
+$('#banner').addEventListener('click', () => {
+  state.queued = 0; $('#banner').classList.remove('show');
+  window.scrollTo({ top: 0, behavior: 'smooth' }); fetchList(true);
+});
+
+$('#mClose').addEventListener('click', closeModal);
+$('#cmpClose').addEventListener('click', closeCompare);
+$('#zIn').addEventListener('click', () => activeZoom?.zoomIn());
+$('#zOut').addEventListener('click', () => activeZoom?.zoomOut());
+$('#zOne').addEventListener('click', () => activeZoom?.oneToOne());
+$('#zFit').addEventListener('click', () => activeZoom?.fit());
+$('#mStar').addEventListener('click', () => { if (state.openItem) toggleStarItem(state.openItem, $('#mStar')); });
+$('#mCmp').addEventListener('click', () => {
+  const it = state.openItem; if (!it) return;
+  if (compareA && compareA.id !== it.id) { const a = compareA; setCompareA(null); closeModal(); openCompare(a, it); }
+  else { setCompareA(it); closeModal(); }
+});
+$('#mAnno').addEventListener('click', startAnnotation);
+$('#mMute').addEventListener('click', async () => {
+  const dir = parentDirOf(state.openItem);
+  if (!dir) return;
+  await apiFetch('/api/mute', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ dir }) });
+  closeModal(); fetchList(true);
+});
+
+$('#m3dBar').addEventListener('click', e => {
+  const m = e.target.closest('[data-m3d]');
+  if (m) { apply3DPrefs({ mode: m.dataset.m3d }); return; }
+  if (e.target.id === 'b3dAO') apply3DPrefs({ ao: !prefs3D.ao });
+  else if (e.target.id === 'b3dLines') apply3DPrefs({ lines: !prefs3D.lines });
+  else if (e.target.id === 'b3dWire') apply3DPrefs({ wire: !prefs3D.wire });
+  else if (e.target.id === 'b3dTopo') apply3DPrefs({ topo: !prefs3D.topo });
+  else if (e.target.id === 'b3dBack') apply3DPrefs({ back: !prefs3D.back });
+  else if (e.target.id === 'b3dCam') {
+    const next = !prefs3D.lockCam;
+    if (next && active3D) lockedCameraState = active3D.getCameraState();
+    apply3DPrefs({ lockCam: next });
+  }
+  else if (e.target.id === 'b3dSpin') apply3DPrefs({ spin: !prefs3D.spin });
+  else if (e.target.id === 'b3dGrid') apply3DPrefs({ grid: !prefs3D.grid });
+  else if (e.target.id === 'b3dReset') { lockedCameraState = null; active3D?.reset(); }
+});
+
+$('#cmp3dBar').addEventListener('click', e => {
+  const m = e.target.closest('[data-m3d]');
+  if (m) { apply3DPrefs({ mode: m.dataset.m3d }); return; }
+  const t = e.target.closest('[data-t3d]');
+  if (t) { const k = t.dataset.t3d; apply3DPrefs({ [k]: !prefs3D[k] }); }
+});
+
+$('#mAnnoBar').addEventListener('click', e => {
+  const t = e.target.closest('[data-atool]');
+  if (t) {
+    annoTool = t.dataset.atool;
+    $('#mAnnoBar').querySelectorAll('[data-atool]').forEach(b => b.classList.toggle('on', b === t));
+  }
+  const c = e.target.closest('[data-acol]');
+  if (c) {
+    annoColor = c.dataset.acol;
+    $('#mAnnoBar').querySelectorAll('[data-acol]').forEach(b => b.classList.toggle('on', b === c));
+  }
+});
+
+$('#mPrev').addEventListener('click', () => { if (state.openIdx > 0) openModal(state.openIdx - 1); });
+$('#mNext').addEventListener('click', () => { if (state.openIdx + 1 < state.items.length) openModal(state.openIdx + 1); });
+$('#mCopy').addEventListener('click', () => { if (state.openItem?.full_path) navigator.clipboard?.writeText(state.openItem.full_path); });
+$('#replySend').addEventListener('click', sendFeedback);
+$('#replyInput').addEventListener('keydown', e => { if (e.key === 'Enter') sendFeedback(); });
+
+window.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
+    if (e.key === 'Escape') e.target.blur();
+    return;
+  }
+  if (e.key === '/') { e.preventDefault(); $('#search').focus(); return; }
+  if (e.key === 'Escape') {
+    if ($('#cmpModal').classList.contains('open')) { closeCompare(); return; }
+    if (state.openItem) { closeModal(); return; }
+    if (compareA) { setCompareA(null); return; }
+  }
+  if ($('#cmpModal').classList.contains('open')) return;
+  if (e.key === 'ArrowLeft' && state.openIdx > 0) { openModal(state.openIdx - 1); return; }
+  if (e.key === 'ArrowRight' && state.openIdx >= 0 && state.openIdx + 1 < state.items.length) { openModal(state.openIdx + 1); return; }
+  if (state.openItem) {
+    const k = e.key.toLowerCase();
+    if (k === 's') { e.preventDefault(); toggleStarItem(state.openItem, $('#mStar')); return; }
+    if (k === 'd' && (state.openItem.kind === 'image' || state.openItem.kind === 'model') && !activeAnnoCleanup) { e.preventDefault(); startAnnotation(); return; }
+  }
+  if (active3D) {
+    const k = e.key.toLowerCase();
+    const modes = { '1': 'shaded', '2': 'clay', '3': 'ao', '4': 'matcap', '5': 'normals', '6': 'flat' };
+    if (modes[k]) { e.preventDefault(); apply3DPrefs({ mode: modes[k] }); }
+    else if (k === 'a') { e.preventDefault(); apply3DPrefs({ ao: !prefs3D.ao }); }
+    else if (k === 'l') { e.preventDefault(); apply3DPrefs({ lines: !prefs3D.lines }); }
+    else if (k === 'w') { e.preventDefault(); apply3DPrefs({ wire: !prefs3D.wire }); }
+    else if (k === 't') { e.preventDefault(); apply3DPrefs({ topo: !prefs3D.topo }); }
+    else if (k === 'b') { e.preventDefault(); apply3DPrefs({ back: !prefs3D.back }); }
+    else if (k === 'c') { e.preventDefault(); if (!prefs3D.lockCam) lockedCameraState = active3D.getCameraState(); apply3DPrefs({ lockCam: !prefs3D.lockCam }); }
+    else if (k === 'g') { e.preventDefault(); apply3DPrefs({ grid: !prefs3D.grid }); }
+    else if (k === 'r') { e.preventDefault(); lockedCameraState = null; active3D.reset(); }
+  } else if (activeZoom) {
+    if (e.key === '+' || e.key === '=') { e.preventDefault(); activeZoom.zoomIn(); }
+    else if (e.key === '-') { e.preventDefault(); activeZoom.zoomOut(); }
+    else if (e.key === '0') { e.preventDefault(); activeZoom.fit(); }
+    else if (e.key === '1') { e.preventDefault(); activeZoom.oneToOne(); }
+  }
+});
+
+window.addEventListener('scroll', () => {
+  if (state.more && !loading && window.innerHeight + window.scrollY >= document.body.offsetHeight - 400) fetchList(false);
+}, { passive: true });
+
+// --- Live Update Loop ---
+let lastVersion = 0, pollInFlight = false;
+async function pollVersion() {
+  if (pollInFlight) return;
+  pollInFlight = true;
+  try {
+    const r = await apiFetch('/api/version');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const info = await r.json();
+    $('#dot').classList.remove('off');
+    if (lastVersion === 0) { lastVersion = info.v || 1; return; }
+    if (info.v && info.v !== lastVersion) {
+      lastVersion = info.v;
+      if (info.id && (info.ev === 'add' || info.ev === 'update')) marks.set(info.id, info.ev === 'add' ? 'new' : 'upd');
+      if (state.paused || window.scrollY > 220) {
+        state.queued++;
+        const b = $('#banner');
+        b.textContent = `${state.queued} new update${state.queued === 1 ? '' : 's'} — click to refresh`;
+        b.classList.add('show');
+        return;
+      }
+      await fetchList(true);
+      if (state.follow && info.id && state.items.length && state.items[0].id === info.id) openModal(0);
+    }
+  } catch { $('#dot').classList.add('off'); }
+  finally { pollInFlight = false; }
+}
+
+(function boot() {
+  fetchList(true);
+  syncHostWorkspaces().then(() => fetchList(true));
+  const initFile = new URLSearchParams(location.search).get('file') || new URLSearchParams(location.search).get('path');
+  if (initFile) openExternalFile(initFile);
+  pollVersion();
+  setInterval(pollVersion, 1200);
+})();
+</script>
+</body>
+</html>

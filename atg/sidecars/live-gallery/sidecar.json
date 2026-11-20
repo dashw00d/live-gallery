@@ -11,7 +11,12 @@
       {
         "path": "/",
         "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
-        "title": "Live Gallery"
+        "title": "Live Gallery",
+        "file_extensions": [
+          ".glb", ".gltf", ".obj", ".stl", ".ply", ".fbx",
+          ".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg",
+          ".mp4", ".webm", ".mov"
+        ]
       }
     ]
   }

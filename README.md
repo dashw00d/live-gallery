@@ -89,3 +89,26 @@ cargo build --release
 
 It builds natively on Linux, macOS and Windows. To make a Windows `.exe` from Linux, install mingw-w64 and run
 `rustup target add x86_64-pc-windows-gnu && cargo build --release --target x86_64-pc-windows-gnu`.
+
+## Antigravity 2.0 Plugin (`atg/`)
+
+An embedded Antigravity 2.0 UI Extension lives in [`atg/`](atg/README.md). It mounts directly inside Antigravity's Auxiliary (Side) Pane and expands Live Gallery into a real-time multimodal stream of **3D models, images, videos, audio, code (with live diffs), text, artifacts, and agent outputs**.
+
+![Live Gallery in Antigravity](atg/assets/screenshot-grid.png)
+![3D Clay + AO + Quad Lines viewer](atg/assets/screenshot-3d.png)
+
+Highlights:
+- **Per-project auto-filtering** (`Project: <name>` ↔ persistent `All projects` toggle) + **auto-watching** folders that agents write to (via `PostToolUse` hooks, `transcript.jsonl`, and symlinked run directories).
+- **Offline 3D inspection:** `Shaded`, `Clay`, `AO` (real-time GTAO), `Matcap`, `Normals`, `Flat`, true quad/polygon `Lines` (no triangle diagonals on `.ply`/`.obj`), `Wire`, `Topo` (non-quads & poles), `Back` (red backfaces), `Lock Cam`, and turntable `Spin`.
+- **A/B Compare:** split slider & synced pan/zoom for images; dual synced cameras for 3D models.
+- **Annotate → Agent:** draw redlines over any image or 3D viewport snapshot and send straight back into the active chat turn.
+- **Revisions, live code diffs, stars (`★`), burst grouping, subfolder mute, and zero-downtime hot reload.**
+
+Install locally:
+
+```bash
+agy plugin validate --strict ./atg
+agy plugin install ./atg
+```
+
+See [`atg/README.md`](atg/README.md) for full details and keyboard shortcuts.

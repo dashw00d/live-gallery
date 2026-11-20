@@ -10,9 +10,11 @@ back to lightweight polling elsewhere.
 """
 import argparse
 import atexit
+import base64
 import ctypes
 import ctypes.util
 import datetime
+import difflib
 import errno
 import hashlib
 import heapq
@@ -70,7 +72,10 @@ for _ctype, _ext in [
 ]:
     mimetypes.add_type(_ctype, _ext)
 
-THUMB_MAX = 2 * 1024 * 1024
+THUMB_MAX = 20 * 1024 * 1024
+REV_MAX_FILE_BYTES = 25 * 1024 * 1024
+REV_MAX_PER_ITEM = 20
+REV_MAX_TOTAL_BYTES = 500 * 1024 * 1024
 TEXT_PREVIEW_BYTES = 1600
 TEXT_MODAL_MAX_BYTES = 256 * 1024
 MAX_WORKSPACE_ITEMS = 2500
@@ -105,6 +110,18 @@ def cache_dir():
 
 def thumbs_dir():
     d = os.path.join(cache_dir(), "thumbs")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def revisions_dir():
+    d = os.path.join(cache_dir(), "revisions")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def annotations_dir():
+    d = os.path.join(cache_dir(), "annotations")
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -247,9 +264,9 @@ PATH_ARG_KEYS = (
     "save_path", "save_dir", "filename", "directory", "dir",
 )
 CMD_OUTPUT_RE = re.compile(
-    r"""(?:>>?|tee\s+(?:-a\s+)?|(?:-o|--out(?:put)?|--out-?dir|--save(?:-dir|-path)?|--dest(?:ination)?|--dir)\s*=?\s*|mkdir\s+(?:-p\s+)?)(["']?)([/~.][^"'\s;|&<>()]+)\1"""
+    r"""(?:>>?|tee\s+(?:-a\s+)?|(?:-o|--out(?:put)?(?:-?dir)?|--runs?-?dir|--work-?dir|--save(?:-dir|-path)?|--dest(?:ination)?|--dir)\s*=?\s*|mkdir\s+(?:-p\s+)?)(["']?)([/~.\w][^"'\s;|&<>()]+)\1"""
 )
-ABS_PATH_RE = re.compile(r"""(?<![\w.-])(/(?:[\w.@+-]+/)+[\w.@+-]+)""")
+CMD_PATH_TOKEN_RE = re.compile(r"""(?:^|[\s"'=(,:])((?:/|~\/|\.\.?\/)?[\w.@+-]+(?:/[\w.@+-]+)+)""")
 
 
 def find_git_root(dir_path):
@@ -287,6 +304,8 @@ def is_blocked_watch_dir(dir_path, brain_dir=None):
         os.path.join(home, ".gemini", "antigravity", "builtin"),
         os.path.join(home, ".gemini", "config"),
         os.path.join(home, ".cache"),
+        os.path.join(home, ".config"),
+        os.path.join(home, ".local"),
     ]
     if brain_dir:
         blocked_prefixes.append(os.path.abspath(os.path.expanduser(brain_dir)))
@@ -320,7 +339,7 @@ def resolve_auto_watch_dir(path, brain_dir=None):
     return d
 
 
-def extract_written_paths(tool_name, args, cwd=""):
+def extract_written_paths(tool_name, args, cwd="", live=False):
     """Return candidate file/directory paths written by an agent tool call."""
     if not isinstance(args, dict):
         return []
@@ -328,23 +347,25 @@ def extract_written_paths(tool_name, args, cwd=""):
     out = []
     seen = set()
 
-    def add_cand(p):
-        p = unwrap_arg(p)
-        if not p:
-            return
-        if p.startswith("file://"):
-            p = urllib.parse.unquote(urllib.parse.urlsplit(p).path)
-        if p.startswith("~"):
-            p = os.path.expanduser(p)
-        elif not os.path.isabs(p):
-            if cwd and os.path.isabs(cwd):
-                p = os.path.join(cwd, p)
-            else:
-                return
-        p = os.path.abspath(p)
-        if p not in seen:
-            seen.add(p)
-            out.append(p)
+    def resolve_token(tok, base_dir):
+        tok = unwrap_arg(tok).rstrip(".,;:")
+        if not tok or tok.startswith("-"):
+            return None
+        if tok.startswith("file://"):
+            tok = urllib.parse.unquote(urllib.parse.urlsplit(tok).path)
+        if tok.startswith("~"):
+            return os.path.abspath(os.path.expanduser(tok))
+        if os.path.isabs(tok):
+            return os.path.abspath(tok)
+        if base_dir and os.path.isabs(base_dir):
+            return os.path.abspath(os.path.join(base_dir, tok))
+        return None
+
+    def add_cand(p, base_dir=cwd):
+        rp = resolve_token(p, base_dir)
+        if rp and rp not in seen:
+            seen.add(rp)
+            out.append(rp)
 
     if tname in WRITE_TOOLS:
         for k in PATH_ARG_KEYS:
@@ -356,28 +377,25 @@ def extract_written_paths(tool_name, args, cwd=""):
         cmd_cwd = unwrap_arg(args.get("Cwd") or args.get("cwd") or "") or cwd
         cmd = unwrap_arg(args.get("CommandLine") or args.get("command") or "")
         if cmd:
+            # 1) Explicit output/dir flags & redirects (absolute or relative)
             for m in CMD_OUTPUT_RE.finditer(cmd):
-                tok = m.group(2).rstrip(".,;:")
-                if tok.startswith(("/", "~", "./", "../")):
-                    add_cand(tok)
-            now = time.time()
-            for m in ABS_PATH_RE.finditer(cmd):
-                cand = m.group(1).rstrip(".,;:")
-                if cand in seen:
-                    continue
-                if os.path.isfile(cand):
-                    if kind_of(cand)[0] is not None:
-                        try:
-                            if now - os.stat(cand).st_mtime < 600:
-                                add_cand(cand)
-                        except OSError:
-                            pass
-                elif os.path.isdir(cand):
+                add_cand(m.group(2), cmd_cwd)
+            # 2) On live completions, also catch positional output dirs/files & inline scripts
+            #    by checking whether path-like tokens were actually modified in the last 30s.
+            if live:
+                now = time.time()
+                for m in CMD_PATH_TOKEN_RE.finditer(cmd):
+                    cand = resolve_token(m.group(1), cmd_cwd)
+                    if not cand or cand in seen:
+                        continue
                     try:
-                        if now - os.stat(cand).st_mtime < 600:
-                            add_cand(cand)
+                        st = os.stat(cand)
                     except OSError:
-                        pass
+                        continue
+                    if 0 <= now - st.st_mtime <= 30:
+                        if os.path.isdir(cand) or kind_of(cand)[0] is not None:
+                            seen.add(cand)
+                            out.append(cand)
         return out
 
     if not tname.startswith(READONLY_PREFIXES):
@@ -493,6 +511,9 @@ class LiveStreamApp:
         self.auto_roots = set()  # roots automatically discovered from agent writes
         self.root_projects = {}  # root_path -> set of project root paths that own/wrote to it
         self.ignored_roots = set()  # roots explicitly removed by user
+        self.muted_dirs = set()  # subfolders muted by user (e.g. refs/, fixtures/)
+        self.starred = set()  # bookmarked item IDs or realpaths
+        self.edit_diffs = {}  # realpath -> last edit_file unified diff string
         self.auto_follow_dirs = True
         self.scope_by_project = True
         self.recent_roots = []
@@ -547,6 +568,12 @@ class LiveStreamApp:
             for r in data.get("ignored_roots", []):
                 if isinstance(r, str) and r.strip():
                     self.ignored_roots.add(os.path.abspath(os.path.expanduser(r.strip())))
+            for r in data.get("muted_dirs", []):
+                if isinstance(r, str) and r.strip():
+                    self.muted_dirs.add(os.path.abspath(os.path.expanduser(r.strip())))
+            for s in data.get("starred", []):
+                if isinstance(s, str) and s.strip():
+                    self.starred.add(s.strip())
             for r in data.get("recent", []):
                 nd = norm_dir(r)
                 if nd and nd not in self.recent_roots:
@@ -562,6 +589,8 @@ class LiveStreamApp:
                     "auto_roots": sorted(self.auto_roots),
                     "root_projects": {k: sorted(v) for k, v in self.root_projects.items() if v},
                     "ignored_roots": sorted(self.ignored_roots),
+                    "muted_dirs": sorted(self.muted_dirs),
+                    "starred": sorted(self.starred)[:500],
                     "auto_follow_dirs": self.auto_follow_dirs,
                     "scope_by_project": self.scope_by_project,
                     "recent": self.recent_roots[:20],
@@ -590,13 +619,7 @@ class LiveStreamApp:
     # ---------- Root management ----------
 
     def _is_ignored(self, nd):
-        for ign in self.ignored_roots:
-            try:
-                if os.path.commonpath([nd, ign]) == ign:
-                    return True
-            except ValueError:
-                pass
-        return False
+        return nd in self.ignored_roots
 
     def _tag_root_project(self, root_path, project):
         if not project:
@@ -881,10 +904,218 @@ class LiveStreamApp:
             "tool": attr.get("tool", ""),
         }
 
+    def _is_muted_path(self, path):
+        if not path or not self.muted_dirs:
+            return False
+        ap = os.path.abspath(path)
+        for md in self.muted_dirs:
+            try:
+                if os.path.commonpath([ap, md]) == md:
+                    return True
+            except ValueError:
+                pass
+        return False
+
+    def _snapshot_revision(self, item):
+        """Stash a copy of an overwritten file under ~/.cache/live-gallery/revisions/."""
+        full = item.get("full_path")
+        if not full or not os.path.isfile(full):
+            return
+        size = item.get("size") or 0
+        if size <= 0 or size > REV_MAX_FILE_BYTES:
+            return
+        iid = item["id"]
+        ext = "." + item["ext"] if item.get("ext") else ""
+        rdir = os.path.join(revisions_dir(), iid)
+        try:
+            os.makedirs(rdir, exist_ok=True)
+            fname = f"{item['mtime_ns']}{ext}"
+            dest = os.path.join(rdir, fname)
+            if os.path.isfile(dest):
+                return
+            shutil.copy2(full, dest)
+            # Prune per-item revisions beyond REV_MAX_PER_ITEM
+            entries = sorted(os.scandir(rdir), key=lambda e: e.name)
+            for old in entries[:-REV_MAX_PER_ITEM]:
+                try:
+                    os.unlink(old.path)
+                except OSError:
+                    pass
+        except OSError:
+            return
+
+    def list_revisions(self, iid):
+        rdir = os.path.join(revisions_dir(), iid)
+        if not os.path.isdir(rdir):
+            return []
+        out = []
+        try:
+            for e in sorted(os.scandir(rdir), key=lambda x: x.name):
+                if not e.is_file():
+                    continue
+                try:
+                    st = e.stat()
+                    stem = os.path.splitext(e.name)[0]
+                    ts = int(stem) / 1e9 if stem.isdigit() else st.st_mtime
+                except Exception:
+                    st = e.stat()
+                    ts = st.st_mtime
+                out.append({
+                    "name": e.name,
+                    "mtime": ts,
+                    "size": st.st_size,
+                    "url": f"/rev/{iid}/{urllib.parse.quote(e.name)}",
+                })
+        except OSError:
+            pass
+        return out
+
+    def toggle_star(self, iid, starred=None):
+        with self.lock:
+            it = self.items.get(iid)
+            key = (it.get("full_path") or iid) if it else iid
+            cur = (key in self.starred) or (iid in self.starred)
+            nxt = (not cur) if starred is None else bool(starred)
+            if nxt:
+                self.starred.add(key)
+            else:
+                self.starred.discard(key)
+                self.starred.discard(iid)
+            self._save_state()
+        self._send_all("refresh", {})
+        return nxt
+
+    def mute_dir(self, dir_path, mute=True):
+        nd = norm_dir(dir_path) or os.path.abspath(os.path.expanduser(dir_path.strip()))
+        with self.lock:
+            if mute:
+                self.muted_dirs.add(nd)
+            else:
+                self.muted_dirs.discard(nd)
+            self._save_state()
+        self._send_all("refresh", {})
+        return sorted(self.muted_dirs)
+
+    def _record_edit_diff(self, args, rpath):
+        target = unwrap_arg(args.get("Target") or args.get("TargetContent") or "")
+        repl = unwrap_arg(args.get("Replacement") or args.get("ReplacementContent") or "")
+        if target or repl:
+            diff_lines = list(difflib.unified_diff(
+                target.splitlines(),
+                repl.splitlines(),
+                fromfile=f"a/{os.path.basename(rpath)}",
+                tofile=f"b/{os.path.basename(rpath)}",
+                lineterm="",
+                n=3,
+            ))
+            if diff_lines:
+                self.edit_diffs[rpath] = "\n".join(diff_lines)
+
+    def get_diff(self, iid):
+        it = self.get_item(iid)
+        if not it or not it.get("full_path"):
+            return {"diff": "", "source": "none"}
+        full = it["full_path"]
+        git_root = find_git_root(os.path.dirname(full))
+        if git_root:
+            try:
+                rel = os.path.relpath(full, git_root)
+                proc = subprocess.run(
+                    ["git", "-C", git_root, "diff", "HEAD", "--", rel],
+                    capture_output=True, text=True, timeout=1.5,
+                )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    return {"diff": proc.stdout, "source": "git"}
+                proc2 = subprocess.run(
+                    ["git", "-C", git_root, "diff", "--", rel],
+                    capture_output=True, text=True, timeout=1.5,
+                )
+                if proc2.returncode == 0 and proc2.stdout.strip():
+                    return {"diff": proc2.stdout, "source": "git"}
+            except Exception:
+                pass
+        cached = self.edit_diffs.get(full)
+        if cached:
+            return {"diff": cached, "source": "edit"}
+        return {"diff": "", "source": "none"}
+
+    def save_annotation(self, image_data_url, convo_id="", item_id="", note="", send=False):
+        if not image_data_url or not isinstance(image_data_url, str):
+            return {"ok": False, "error": "missing image_data_url"}
+        m = re.match(r"^data:image/(png|webp|jpeg);base64,(.+)$", image_data_url, re.S)
+        if not m:
+            return {"ok": False, "error": "invalid data URL"}
+        ext = "jpg" if m.group(1) == "jpeg" else m.group(1)
+        try:
+            raw = base64.b64decode(m.group(2))
+        except Exception:
+            return {"ok": False, "error": "invalid base64"}
+        if len(raw) > THUMB_MAX:
+            return {"ok": False, "error": "image too large"}
+
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        fname = f"annotated_{ts}.{ext}"
+        dest_dir = annotations_dir()
+        if convo_id and self.brain_dir:
+            cdir = os.path.join(self.brain_dir, os.path.basename(convo_id))
+            if os.path.isdir(cdir):
+                dest_dir = cdir
+        out_path = os.path.join(dest_dir, fname)
+        try:
+            with open(out_path, "wb") as f:
+                f.write(raw)
+        except OSError as e:
+            return {"ok": False, "error": str(e)}
+
+        # Index the annotated screenshot right away
+        self._upsert_file(
+            out_path,
+            "artifact" if dest_dir != annotations_dir() else "output",
+            dest_dir,
+            fname,
+            convo_id=convo_id,
+            notify=True,
+        )
+
+        it = self.get_item(item_id) if item_id else None
+        ref = f"Regarding `{it['rel']}` ({it['full_path']}):\n" if it and it.get("full_path") else ""
+        prompt = f"{ref}Annotated screenshot saved at `{out_path}`.\n{(note or '').strip()}".strip()
+        sent = False
+        send_err = ""
+        if send:
+            res = self.send_reply(convo_id, prompt)
+            sent = bool(res.get("ok"))
+            send_err = res.get("error", "")
+        return {"ok": True, "path": out_path, "prompt": prompt, "sent": sent, "send_error": send_err}
+
+    def item_by_path(self, raw_path):
+        p = unwrap_arg(raw_path)
+        if not p:
+            return None
+        if p.startswith("file://"):
+            p = urllib.parse.unquote(urllib.parse.urlsplit(p).path)
+        full = os.path.abspath(os.path.expanduser(p))
+        if not os.path.isfile(full):
+            return None
+        rpath = os.path.realpath(full)
+        with self.lock:
+            iid = self.file_index.get(rpath)
+            if iid and iid in self.items:
+                return self.public_item(self.items[iid])
+        source, root, owner_cid = self._find_owner_root(rpath)
+        if source:
+            it = self._upsert_file(rpath, source, root, os.path.relpath(rpath, root), convo_id=owner_cid, notify=True)
+        else:
+            it = self._upsert_file(rpath, "output", os.path.dirname(rpath), os.path.basename(rpath), notify=True)
+        return self.public_item(it) if it else None
+
     def _upsert_file(self, full_path, source, root_path, rel_path, convo_id=None, notify=True, defer_prune=False):
+        if source == "workspace" and self._is_muted_path(full_path):
+            return None
         item = self._build_file_item(full_path, source, root_path, rel_path, convo_id=convo_id)
         if not item:
             return None
+        should_snapshot = False
         with self.lock:
             existing = self.items.get(item["id"])
             if existing and existing.get("mtime_ns") == item["mtime_ns"] and existing.get("size") == item["size"]:
@@ -897,10 +1128,16 @@ class LiveStreamApp:
                         self._queue_event(item["id"], "update")
                 return existing
             ev = "update" if existing else "add"
+            if ev == "update" and notify:
+                should_snapshot = True
             self.items[item["id"]] = item
             self.file_index[item["full_path"]] = item["id"]
             if not defer_prune:
                 self._prune_if_needed()
+        if notify and not defer_prune:
+            # Snapshot on first live write & every subsequent live update so revisions accumulate
+            if should_snapshot or (ev == "add" and time.time() - item["mtime"] < 120):
+                self._snapshot_revision(item)
         if notify:
             self._queue_event(item["id"], ev)
         return item
@@ -936,42 +1173,62 @@ class LiveStreamApp:
                 self.items.pop(it["id"], None)
 
     def _watch_dir(self, dir_path):
-        if self._inotify and dir_path not in self._watched_dirs:
-            if self._inotify.add(dir_path):
-                self._watched_dirs.add(dir_path)
+        if self._inotify:
+            target = os.path.realpath(dir_path)
+            if target not in self._watched_dirs:
+                if self._inotify.add(target):
+                    self._watched_dirs.add(target)
 
     def _scan_root(self, root_path):
         if not os.path.isdir(root_path):
             return
         candidates = []
         dir_count = 0
+        seen_inodes = set()
         stack = [root_path]
         while stack and not self._stop.is_set():
             cur = stack.pop()
+            try:
+                dst = os.stat(cur)
+                inode_key = (dst.st_dev, dst.st_ino)
+                if inode_key in seen_inodes:
+                    continue
+                seen_inodes.add(inode_key)
+            except OSError:
+                continue
             dir_count += 1
             if dir_count > MAX_SCAN_DIRS_PER_ROOT:
                 break
             self._watch_dir(cur)
             try:
+                sub_dirs = []
                 with os.scandir(cur) as it:
                     for e in it:
                         name = e.name
                         try:
-                            if e.is_dir(follow_symlinks=False):
+                            if e.is_dir(follow_symlinks=True):
                                 if not self._should_skip_dir(name):
-                                    stack.append(e.path)
+                                    try:
+                                        dmt = e.stat(follow_symlinks=True).st_mtime
+                                    except OSError:
+                                        dmt = 0
+                                    sub_dirs.append((dmt, e.path))
                                 continue
-                            if not e.is_file(follow_symlinks=False):
+                            if not e.is_file(follow_symlinks=True):
                                 continue
                             kind, _ = kind_of(name)
                             if not kind:
                                 continue
-                            st = e.stat(follow_symlinks=False)
+                            st = e.stat(follow_symlinks=True)
                             if st.st_size == 0 and kind in ("image", "model", "video", "audio"):
                                 continue
                             candidates.append((st.st_mtime, e.path))
                         except OSError:
                             continue
+                # Visit newest subdirs first so active run/output folders are never skipped by dir cap
+                sub_dirs.sort(key=lambda x: x[0])
+                for _, sp in sub_dirs:
+                    stack.append(sp)
             except OSError:
                 continue
 
@@ -1006,10 +1263,12 @@ class LiveStreamApp:
                     if not name:
                         continue
                     full = os.path.join(dir_path, name)
-                    if mask & Inotify.ISDIR:
-                        if mask & (Inotify.CREATE | Inotify.MOVED_TO):
+                    if mask & (Inotify.CREATE | Inotify.MOVED_TO):
+                        if (mask & Inotify.ISDIR) or os.path.isdir(full):
                             if not self._should_skip_dir(name):
                                 self._scan_subtree_for_event(full)
+                            continue
+                    if mask & Inotify.ISDIR:
                         continue
                     if mask & (Inotify.DELETE | Inotify.MOVED_FROM):
                         self._delete_file_path(full)
@@ -1022,9 +1281,11 @@ class LiveStreamApp:
     def _find_owner_root(self, full_path):
         with self.lock:
             roots = list(self.roots)
+        rfull = os.path.realpath(full_path)
         for r in roots:
+            rr = os.path.realpath(r)
             try:
-                if os.path.commonpath([full_path, r]) == r:
+                if os.path.commonpath([full_path, r]) == r or os.path.commonpath([rfull, rr]) == rr:
                     return "workspace", r, None
             except ValueError:
                 pass
@@ -1042,16 +1303,39 @@ class LiveStreamApp:
         source, root, cid = self._find_owner_root(sub_dir)
         if not source:
             return
-        for dirpath, dirnames, filenames in os.walk(sub_dir):
-            dirnames[:] = [d for d in dirnames if not self._should_skip_dir(d)]
-            self._watch_dir(dirpath)
-            for fname in filenames:
-                kind, _ = kind_of(fname)
-                if not kind:
+        seen_inodes = set()
+        stack = [sub_dir]
+        while stack:
+            cur = stack.pop()
+            try:
+                dst = os.stat(cur)
+                ik = (dst.st_dev, dst.st_ino)
+                if ik in seen_inodes:
                     continue
-                full = os.path.join(dirpath, fname)
-                rel = os.path.relpath(full, root)
-                self._upsert_file(full, source, root, rel, convo_id=cid, notify=True)
+                seen_inodes.add(ik)
+            except OSError:
+                continue
+            self._watch_dir(cur)
+            try:
+                with os.scandir(cur) as it:
+                    for e in it:
+                        name = e.name
+                        try:
+                            if e.is_dir(follow_symlinks=True):
+                                if not self._should_skip_dir(name):
+                                    stack.append(e.path)
+                                continue
+                            if not e.is_file(follow_symlinks=True):
+                                continue
+                            kind, _ = kind_of(name)
+                            if not kind:
+                                continue
+                            rel = os.path.relpath(e.path, root)
+                            self._upsert_file(e.path, source, root, rel, convo_id=cid, notify=True)
+                        except OSError:
+                            continue
+            except OSError:
+                continue
 
     def _handle_file_change(self, full_path):
         kind, _ = kind_of(full_path)
@@ -1215,12 +1499,13 @@ class LiveStreamApp:
 
         # Extract tool call written paths & auto-follow their folders
         convo_rec = self.conversations.get(cid, {})
-        convo_ws = convo_rec.get("workspace", "")
         convo_proj = convo_rec.get("project", "")
+        convo_ws = convo_rec.get("workspace", "") or convo_proj
+        is_live_step = notify and (abs(time.time() - ts) < 60)
         for tc in step.get("tool_calls") or []:
             tname = tc.get("name", "")
             args = tc.get("args") or {}
-            for written in extract_written_paths(tname, args, cwd=convo_ws):
+            for written in extract_written_paths(tname, args, cwd=convo_ws, live=is_live_step):
                 self.auto_follow_path(
                     written,
                     convo_id=cid,
@@ -1233,6 +1518,7 @@ class LiveStreamApp:
                 )
                 if not convo_proj:
                     convo_proj = self.conversations.get(cid, {}).get("project", "")
+                    convo_ws = convo_ws or convo_proj
 
         # Extract media attachments
         for m in step.get("media") or []:
@@ -1342,7 +1628,9 @@ class LiveStreamApp:
             self._tail_transcript(cid, transcript_path, notify=True, allow_auto_roots=True)
 
         base_cwd = cwd or (workspaces[0] if workspaces else "")
-        for written in extract_written_paths(tname, args, cwd=base_cwd):
+        for written in extract_written_paths(tname, args, cwd=base_cwd, live=True):
+            if tname.lower() in ("edit_file", "replace_file_content", "multi_replace_file_content"):
+                self._record_edit_diff(args, os.path.realpath(written) if os.path.exists(written) else written)
             self.auto_follow_path(
                 written,
                 convo_id=cid,
@@ -1366,7 +1654,10 @@ class LiveStreamApp:
                 it["lines"] = lines
             else:
                 it["snippet"] = ""
-        return {k: v for k, v in it.items() if k not in ("full_text", "mtime_ns")}
+        pub = {k: v for k, v in it.items() if k not in ("full_text", "mtime_ns")}
+        key = it.get("full_path") or it["id"]
+        pub["starred"] = (key in self.starred) or (it["id"] in self.starred)
+        return pub
 
     def _is_under(self, path, parent):
         if not path or not parent:
@@ -1428,10 +1719,12 @@ class LiveStreamApp:
 
         counts = {
             "all": 0, "media": 0, "model": 0, "image": 0,
-            "video": 0, "audio": 0, "code": 0, "text": 0, "agent": 0,
+            "video": 0, "audio": 0, "code": 0, "text": 0, "agent": 0, "starred": 0,
         }
         filtered = []
         for it in all_items:
+            if it.get("source") == "workspace" and self._is_muted_path(it.get("full_path")):
+                continue
             if use_project_scope:
                 it_convo = it.get("convo") or ""
                 it_convo_proj = convo_map.get(it_convo, {}).get("project", "") if it_convo else ""
@@ -1460,13 +1753,19 @@ class LiveStreamApp:
                 if needle not in hay:
                     continue
             k = it["kind"]
+            key = it.get("full_path") or it["id"]
+            is_star = (key in self.starred) or (it["id"] in self.starred)
             counts["all"] += 1
+            if is_star:
+                counts["starred"] += 1
             if k in counts:
                 counts[k] += 1
             if k in ("model", "image", "video", "audio"):
                 counts["media"] += 1
 
             if kind == "all":
+                filtered.append(it)
+            elif kind == "starred" and is_star:
                 filtered.append(it)
             elif kind == "media" and k in ("model", "image", "video", "audio"):
                 filtered.append(it)
@@ -1481,6 +1780,7 @@ class LiveStreamApp:
             "more": offset + limit < len(filtered),
             "counts": counts,
             "roots": roots,
+            "muted_dirs": sorted(self.muted_dirs),
             "recent": recent,
             "auto_follow_dirs": self.auto_follow_dirs,
             "scope_by_project": scope_by_project,
@@ -1624,21 +1924,44 @@ def make_handler(app, bound_port):
                 with app.lock:
                     return self.send_json(dict(app.last_event))
             if path == "/" or path == "/index.html":
-                return self.send_bytes(PAGE.encode("utf-8"), "text/html; charset=utf-8")
+                ui_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui.html")
+                try:
+                    with open(ui_path, "rb") as f:
+                        return self.send_bytes(f.read(), "text/html; charset=utf-8")
+                except OSError:
+                    return self.send_bytes(PAGE.encode("utf-8"), "text/html; charset=utf-8")
             if path == "/preload.js":
-                return self.send_bytes(b"/* standalone preload stub */\n", "text/javascript; charset=utf-8")
+                return self.send_bytes(b"/* standalone preload stub */\n", "application/javascript; charset=utf-8")
+            if path == "/three-kit.js":
+                kit_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor", "three-kit.js")
+                try:
+                    with open(kit_path, "rb") as f:
+                        return self.send_bytes(f.read(), "application/javascript; charset=utf-8", cache="private, max-age=86400")
+                except OSError:
+                    return self.send_error(404)
             if path == "/kit.js":
-                return self.send_bytes(KIT_JS.encode("utf-8"), "text/javascript; charset=utf-8")
+                return self.send_bytes(KIT_JS.encode("utf-8"), "application/javascript; charset=utf-8")
             if path == "/worker.js":
-                return self.send_bytes(WORKER_JS.encode("utf-8"), "text/javascript; charset=utf-8")
+                return self.send_bytes(WORKER_JS.encode("utf-8"), "application/javascript; charset=utf-8")
             if path == "/api/list":
                 return self.send_json(app.listing(q))
             if path == "/api/dirs":
                 return self.send_json({"dirs": complete_dirs(q.get("prefix", ""))})
             if path == "/api/text":
                 return self.serve_text(q.get("id", ""))
+            if path == "/api/diff":
+                return self.send_json(app.get_diff(q.get("id", "")))
+            if path == "/api/revisions":
+                return self.send_json({"revisions": app.list_revisions(q.get("id", ""))})
+            if path == "/api/item-by-path":
+                it = app.item_by_path(q.get("path", ""))
+                if not it:
+                    return self.send_json({"error": "not found"}, 404)
+                return self.send_json({"item": it})
             if path == "/events":
                 return self.serve_events()
+            if path.startswith("/rev/"):
+                return self.serve_revision(path[5:])
             if path.startswith("/f/"):
                 return self.serve_file(path[3:], versioned="v" in q)
             if path.startswith("/t/"):
@@ -1709,6 +2032,32 @@ def make_handler(app, bound_port):
                     return self.send_json(resp)
                 return self.send_json({"error": "no valid settings"}, 400)
 
+            if u.path == "/api/star":
+                iid = data.get("id", "")
+                if not iid:
+                    return self.send_json({"error": "missing id"}, 400)
+                st = app.toggle_star(iid, data.get("starred"))
+                return self.send_json({"ok": True, "starred": st})
+
+            if u.path == "/api/mute":
+                if "dir" in data:
+                    muted = app.mute_dir(data["dir"], mute=True)
+                    return self.send_json({"ok": True, "muted_dirs": muted})
+                if "unmute" in data:
+                    muted = app.mute_dir(data["unmute"], mute=False)
+                    return self.send_json({"ok": True, "muted_dirs": muted})
+                return self.send_json({"error": "missing dir/unmute"}, 400)
+
+            if u.path == "/api/annotate":
+                res = app.save_annotation(
+                    data.get("image_data_url", ""),
+                    convo_id=data.get("convo", ""),
+                    item_id=data.get("item_id", ""),
+                    note=data.get("note", ""),
+                    send=bool(data.get("send", False)),
+                )
+                return self.send_json(res, 200 if res.get("ok") else 400)
+
             if u.path == "/api/reply":
                 res = app.send_reply(data.get("convo", ""), data.get("message", ""))
                 return self.send_json(res, 200 if res.get("ok") else 400)
@@ -1770,6 +2119,16 @@ def make_handler(app, bound_port):
                 return self.send_error(404)
             self.send_bytes(body, image_type(body[:16]) or "image/webp", cache=IMMUTABLE)
 
+        def serve_revision(self, rest):
+            iid, _, name = rest.partition("/")
+            name = os.path.basename(urllib.parse.unquote(name))
+            if not iid or not name or any(c not in "0123456789abcdef" for c in iid):
+                return self.send_error(404)
+            full = os.path.join(revisions_dir(), iid, name)
+            if not os.path.isfile(full):
+                return self.send_error(404)
+            return self._stream_local_file(full, versioned=True)
+
         def serve_file(self, iid, versioned=False):
             # Support relative companion files for glTF (e.g. /f/<iid>/textures/albedo.png)
             base_id, _, extra = iid.partition("/")
@@ -1789,7 +2148,9 @@ def make_handler(app, bound_port):
                 full = cand
             if not os.path.isfile(full):
                 return self.send_error(404)
+            return self._stream_local_file(full, versioned=versioned)
 
+        def _stream_local_file(self, full, versioned=False):
             ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
             try:
                 size = os.path.getsize(full)
@@ -1932,16 +2293,18 @@ export async function drawThumb(kit, url, ext) {
 }
 """
 
-WORKER_JS = r"""import { thumbKit, drawThumb } from './kit.js';
+WORKER_JS = r"""importScripts('/three-kit.js');
 let kit = null;
 self.onmessage = async e => {
   const { url, ext, size } = e.data;
+  const G = self.LiveGallery3D;
+  if (!G) { postMessage({ error: '3D kit unavailable', fatal: true }); return; }
   if (!kit) {
-    try { kit = await thumbKit(new OffscreenCanvas(size, size), size); }
+    try { kit = await G.thumbKit(new OffscreenCanvas(size, size), size); }
     catch (err) { postMessage({ error: String(err?.message || err), fatal: true }); return; }
   }
   try {
-    await drawThumb(kit, url, ext);
+    await G.drawThumb(kit, url, ext);
     postMessage({ blob: await kit.r.domElement.convertToBlob({ type: 'image/webp', quality: 0.9 }) });
   } catch (err) {
     const error = String(err?.message || err);
@@ -2047,6 +2410,11 @@ main{padding:10px}
 .m-zoom{display:none;align-items:center;gap:4px}
 .m-zoom.show{display:inline-flex}
 .m-zoom .zpct{min-width:44px;text-align:center;font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+.m-3d{display:none;flex-wrap:wrap;align-items:center;gap:5px;padding:6px 12px;background:var(--panel);border-bottom:1px solid var(--line)}
+.m-3d.show{display:flex}
+.m-3d .sep{width:1px;height:16px;background:var(--line);margin:0 2px}
+.m-3d .btn{padding:2px 7px;font-size:11.5px}
+.m-stats{position:absolute;left:10px;bottom:10px;padding:3px 8px;border-radius:6px;background:var(--badge-bg);border:1px solid var(--line);font-size:11px;color:var(--muted);pointer-events:none;font-variant-numeric:tabular-nums}
 .m-body audio{width:min(520px,90%)}
 .m-body canvas{width:100%!important;height:100%!important;display:block}
 .m-body iframe{width:100%;height:100%;border:0;background:#fff}
@@ -2099,6 +2467,20 @@ main{padding:10px}
     <button class="btn" id="mCopy">Copy path</button>
     <button class="btn" id="mClose">Esc</button>
   </div>
+  <div class="m-3d" id="m3dBar">
+    <button class="btn" data-m3d="shaded" title="Original / PBR shaded (1)">Shaded</button>
+    <button class="btn" data-m3d="clay" title="Matte sculpt clay (2)">Clay</button>
+    <button class="btn" data-m3d="ao" title="Pure Ambient Occlusion cavity pass (3)">AO</button>
+    <button class="btn" data-m3d="matcap" title="Studio Matcap (4)">Matcap</button>
+    <button class="btn" data-m3d="normals" title="Normal map colors (5)">Normals</button>
+    <button class="btn" data-m3d="flat" title="Flat faceted shading (6)">Flat</button>
+    <span class="sep"></span>
+    <button class="btn" id="b3dAO" title="Toggle real-time GTAO overlay (A)">+AO</button>
+    <button class="btn" id="b3dLines" title="Toggle quad/polygon edge lines (L)">Lines</button>
+    <button class="btn" id="b3dWire" title="Toggle triangle wireframe (W)">Wire</button>
+    <button class="btn" id="b3dGrid" title="Toggle floor grid (G)">Grid</button>
+    <button class="btn" id="b3dReset" title="Reset camera (R)">Reset</button>
+  </div>
   <div class="m-body" id="mBody"></div>
   <div class="m-foot">
     <input id="replyInput" placeholder="Send feedback about this item back to the agent...">
@@ -2108,10 +2490,19 @@ main{padding:10px}
 </div>
 
 <script>
-let kitMod = null;
-async function getKit() {
-  if (!kitMod) kitMod = await import('./kit.js');
-  return kitMod;
+let kitPromise = null;
+function getKit() {
+  if (window.LiveGallery3D) return Promise.resolve(window.LiveGallery3D);
+  if (!kitPromise) {
+    kitPromise = new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = '/three-kit.js';
+      s.onload = () => window.LiveGallery3D ? resolve(window.LiveGallery3D) : reject(new Error('three-kit.js did not initialize'));
+      s.onerror = () => { kitPromise = null; reject(new Error('Failed to load /three-kit.js')); };
+      document.head.appendChild(s);
+    });
+  }
+  return kitPromise;
 }
 
 function apiFetch(url, opts) {
@@ -2230,9 +2621,9 @@ function observeThumb(cardEl, item, imgEl) {
   thumbObserver.observe(cardEl);
 }
 function initWorker() {
-  if (worker) return;
+  if (worker !== null) return;
   try {
-    worker = new Worker('./worker.js', { type: 'module' });
+    worker = new Worker('/worker.js');
   } catch { worker = false; }
 }
 
@@ -2463,6 +2854,42 @@ function renderGrid(reset) {
 
 // --- Lightbox viewer ---
 let activeZoom = null;
+let active3D = null;
+let prefs3D = (() => {
+  try {
+    const saved = JSON.parse(localStorage.getItem('lg-3d-prefs') || '{}');
+    return {
+      mode: saved.mode || 'shaded',
+      ao: !!saved.ao,
+      lines: !!saved.lines,
+      wire: !!saved.wire,
+      grid: !!saved.grid,
+    };
+  } catch {
+    return { mode: 'shaded', ao: false, lines: false, wire: false, grid: false };
+  }
+})();
+
+function save3DPrefs() {
+  try { localStorage.setItem('lg-3d-prefs', JSON.stringify(prefs3D)); } catch {}
+}
+
+function sync3DBar() {
+  const bar = $('#m3dBar');
+  if (!bar) return;
+  bar.querySelectorAll('[data-m3d]').forEach(b => b.classList.toggle('on', b.dataset.m3d === prefs3D.mode));
+  $('#b3dAO').classList.toggle('on', prefs3D.ao || prefs3D.mode === 'ao');
+  $('#b3dLines').classList.toggle('on', prefs3D.lines);
+  $('#b3dWire').classList.toggle('on', prefs3D.wire);
+  $('#b3dGrid').classList.toggle('on', prefs3D.grid);
+}
+
+function apply3DPrefs(patch) {
+  prefs3D = { ...prefs3D, ...patch };
+  save3DPrefs();
+  sync3DBar();
+  if (active3D) active3D.setState(prefs3D);
+}
 
 function attachPanZoom(body, el, isVideo = false) {
   el.draggable = false;
@@ -2605,36 +3032,33 @@ async function openModal(idx) {
   } else if (it.kind === 'model') {
     body.innerHTML = '<div style="color:var(--muted)">Loading 3D model...</div>';
     try {
-      const { three, orbit, loadModel, stage, frame, dispose } = await getKit();
-      const [{ THREE }, OrbitControls] = await Promise.all([three(), orbit()]);
+      const { createViewer } = await getKit();
       if (state.openIdx !== idx) return;
       body.innerHTML = '';
       const canvas = document.createElement('canvas');
       body.appendChild(canvas);
-      const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
-      renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-      const scene = stage(renderer);
-      const cam = new THREE.PerspectiveCamera(38, 1, 0.01, 1000);
-      const ctl = new OrbitControls(cam, canvas);
-      ctl.enableDamping = true;
-      const obj = await loadModel(fUrl, it.ext);
-      if (state.openIdx !== idx) { dispose(obj); renderer.dispose(); return; }
-      scene.add(obj);
-      const resize = () => {
-        const w = body.clientWidth || 600, h = body.clientHeight || 400;
-        renderer.setSize(w, h, false);
-        cam.aspect = w / h; cam.updateProjectionMatrix();
-      };
-      resize();
-      frame(cam, obj, ctl);
-      let raf = 0;
-      const tick = () => { raf = requestAnimationFrame(tick); ctl.update(); renderer.render(scene, cam); };
-      tick();
-      window.addEventListener('resize', resize);
+      const viewer = await createViewer(canvas, body, fUrl, it.ext, prefs3D);
+      if (state.openIdx !== idx) { viewer.destroy(); return; }
+      active3D = viewer;
+      $('#m3dBar').classList.add('show');
+      sync3DBar();
+      const st = viewer.stats || {};
+      const parts = [];
+      if (st.verts) parts.push(`${st.verts.toLocaleString()} verts`);
+      if (st.quads) parts.push(`${st.quads.toLocaleString()} quads`);
+      if (st.tris) parts.push(`${st.tris.toLocaleString()} tris`);
+      if (st.ngons) parts.push(`${st.ngons.toLocaleString()} ngons`);
+      if (!st.quads && !st.tris && st.faces) parts.push(`${st.faces.toLocaleString()} faces`);
+      if (parts.length) {
+        const pill = document.createElement('div');
+        pill.className = 'm-stats';
+        pill.textContent = parts.join(' · ') + (viewer.hasPolyLines ? ' · poly edges' : '');
+        body.appendChild(pill);
+      }
       viewerCleanup = () => {
-        cancelAnimationFrame(raf);
-        window.removeEventListener('resize', resize);
-        ctl.dispose(); dispose(obj); renderer.dispose();
+        active3D = null;
+        $('#m3dBar').classList.remove('show');
+        viewer.destroy();
       };
     } catch (err) {
       body.innerHTML = `<div style="color:#f87171">Failed to load 3D model: ${esc(err?.message || err)}</div>`;
@@ -2824,6 +3248,15 @@ $('#zIn').addEventListener('click', () => activeZoom?.zoomIn());
 $('#zOut').addEventListener('click', () => activeZoom?.zoomOut());
 $('#zOne').addEventListener('click', () => activeZoom?.oneToOne());
 $('#zFit').addEventListener('click', () => activeZoom?.fit());
+$('#m3dBar').addEventListener('click', e => {
+  const m = e.target.closest('[data-m3d]');
+  if (m) { apply3DPrefs({ mode: m.dataset.m3d }); return; }
+  if (e.target.id === 'b3dAO') apply3DPrefs({ ao: !prefs3D.ao });
+  else if (e.target.id === 'b3dLines') apply3DPrefs({ lines: !prefs3D.lines });
+  else if (e.target.id === 'b3dWire') apply3DPrefs({ wire: !prefs3D.wire });
+  else if (e.target.id === 'b3dGrid') apply3DPrefs({ grid: !prefs3D.grid });
+  else if (e.target.id === 'b3dReset') active3D?.reset();
+});
 $('#mPrev').addEventListener('click', () => { if (state.openIdx > 0) openModal(state.openIdx - 1); });
 $('#mNext').addEventListener('click', () => { if (state.openIdx + 1 < state.items.length) openModal(state.openIdx + 1); });
 $('#mCopy').addEventListener('click', () => {
@@ -2842,6 +3275,16 @@ window.addEventListener('keydown', e => {
   else if (e.key === 'Escape' && state.openIdx >= 0) closeModal();
   else if (e.key === 'ArrowLeft' && state.openIdx > 0) openModal(state.openIdx - 1);
   else if (e.key === 'ArrowRight' && state.openIdx + 1 < state.items.length) openModal(state.openIdx + 1);
+  else if (active3D) {
+    const k = e.key.toLowerCase();
+    const modes = { '1': 'shaded', '2': 'clay', '3': 'ao', '4': 'matcap', '5': 'normals', '6': 'flat' };
+    if (modes[k]) { e.preventDefault(); apply3DPrefs({ mode: modes[k] }); }
+    else if (k === 'a') { e.preventDefault(); apply3DPrefs({ ao: !prefs3D.ao }); }
+    else if (k === 'l') { e.preventDefault(); apply3DPrefs({ lines: !prefs3D.lines }); }
+    else if (k === 'w') { e.preventDefault(); apply3DPrefs({ wire: !prefs3D.wire }); }
+    else if (k === 'g') { e.preventDefault(); apply3DPrefs({ grid: !prefs3D.grid }); }
+    else if (k === 'r') { e.preventDefault(); active3D.reset(); }
+  }
   else if (activeZoom && (e.key === '+' || e.key === '=')) { e.preventDefault(); activeZoom.zoomIn(); }
   else if (activeZoom && e.key === '-') { e.preventDefault(); activeZoom.zoomOut(); }
   else if (activeZoom && e.key === '0') { e.preventDefault(); activeZoom.fit(); }

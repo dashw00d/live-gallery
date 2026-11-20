@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
@@ -7,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { SidecarApp } from 'sidecar_sdk';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const serverPyPath = path.join(__dirname, 'server.py');
 
 function getFreePort() {
   return new Promise((resolve, reject) => {
@@ -20,7 +22,7 @@ function getFreePort() {
   });
 }
 
-function waitForHealth(port, timeoutMs = 5000) {
+function waitForHealth(port, timeoutMs = 8000) {
   const deadline = Date.now() + timeoutMs;
   return new Promise((resolve, reject) => {
     const attempt = () => {
@@ -40,34 +42,86 @@ function waitForHealth(port, timeoutMs = 5000) {
   });
 }
 
-const pyPort = await getFreePort();
-const pyEnv = { ...process.env };
-delete pyEnv.ANTIGRAVITY_SIDECAR_WEB_PORT;
-delete pyEnv.PORT;
-
-const py = spawn('python3', [path.join(__dirname, 'server.py'), '--port', String(pyPort)], {
-  cwd: __dirname,
-  env: pyEnv,
-  stdio: 'inherit',
-});
-
+let activePy = null;
+let activePyPort = 0;
 let shuttingDown = false;
+let reloading = false;
+
+async function startPythonBackend() {
+  const pyPort = await getFreePort();
+  const pyEnv = { ...process.env };
+  delete pyEnv.ANTIGRAVITY_SIDECAR_WEB_PORT;
+  delete pyEnv.PORT;
+
+  const child = spawn('python3', [serverPyPath, '--port', String(pyPort)], {
+    cwd: __dirname,
+    env: pyEnv,
+    stdio: 'inherit',
+  });
+
+  child.on('exit', (code) => {
+    if (!shuttingDown && child === activePy) {
+      console.error(`[live-gallery] Python backend exited with code ${code}; restarting backend...`);
+      setTimeout(() => {
+        if (!shuttingDown && child === activePy) {
+          reloadBackend().catch((err) => console.error('[live-gallery] restart failed:', err.message));
+        }
+      }, 400);
+    }
+  });
+
+  await waitForHealth(pyPort);
+  return { child, pyPort };
+}
+
+async function reloadBackend() {
+  if (reloading || shuttingDown) return false;
+  reloading = true;
+  try {
+    const prev = activePy;
+    const { child, pyPort } = await startPythonBackend();
+    activePy = child;
+    activePyPort = pyPort;
+    console.log(`[live-gallery] hot-swapped python backend -> 127.0.0.1:${pyPort}`);
+    if (prev && prev !== child) {
+      setTimeout(() => {
+        try { prev.kill('SIGTERM'); } catch {}
+      }, 300);
+    }
+    return true;
+  } finally {
+    reloading = false;
+  }
+}
+
 function cleanup() {
   if (shuttingDown) return;
   shuttingDown = true;
-  try { py.kill('SIGTERM'); } catch {}
+  try { activePy?.kill('SIGTERM'); } catch {}
 }
 process.on('SIGTERM', () => { cleanup(); process.exit(0); });
 process.on('SIGINT', () => { cleanup(); process.exit(0); });
 process.on('exit', cleanup);
-py.on('exit', (code) => {
-  if (!shuttingDown) {
-    console.error(`[live-gallery] Python backend exited with code ${code}`);
-    process.exit(code || 1);
-  }
-});
 
-await waitForHealth(pyPort);
+// Initial boot
+{
+  const { child, pyPort } = await startPythonBackend();
+  activePy = child;
+  activePyPort = pyPort;
+}
+
+// Watch server.py for zero-downtime hot reload (never triggers Antigravity sidecar restart!)
+let watchTimer = null;
+try {
+  fs.watch(__dirname, (_, filename) => {
+    if (filename === 'server.py') {
+      clearTimeout(watchTimer);
+      watchTimer = setTimeout(() => {
+        reloadBackend().catch((err) => console.error('[live-gallery] hot-reload failed:', err.message));
+      }, 350);
+    }
+  });
+} catch {}
 
 const app = new SidecarApp();
 const server = await app.run();
@@ -81,6 +135,21 @@ function isSdkRoute(urlStr) {
 
 server.on('request', (req, res) => {
   const reqUrl = req.url || '/';
+  const pathname = reqUrl.split('?')[0];
+
+  if (pathname === '/_lg/reload' && req.method === 'POST') {
+    reloadBackend()
+      .then((ok) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok, port: activePyPort }));
+      })
+      .catch((err) => {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: err.message }));
+      });
+    return;
+  }
+
   if (isSdkRoute(reqUrl)) {
     for (const listener of origListeners) {
       listener.call(server, req, res);
@@ -88,14 +157,14 @@ server.on('request', (req, res) => {
     return;
   }
 
-  // Transparent streaming proxy to the local Python Live Gallery backend
-  const headers = { ...req.headers, host: `127.0.0.1:${pyPort}`, connection: 'close' };
+  const targetPort = activePyPort;
+  const headers = { ...req.headers, host: `127.0.0.1:${targetPort}`, connection: 'close' };
   delete headers['accept-encoding'];
 
   const proxyReq = http.request(
     {
       hostname: '127.0.0.1',
-      port: pyPort,
+      port: targetPort,
       path: reqUrl,
       method: req.method,
       headers,
@@ -128,4 +197,4 @@ server.on('request', (req, res) => {
   }
 });
 
-console.log(`[live-gallery] SidecarApp proxy ready -> python backend 127.0.0.1:${pyPort}`);
+console.log(`[live-gallery] SidecarApp proxy ready -> python backend 127.0.0.1:${activePyPort}`);
