@@ -1,0 +1,23 @@
+{
+  "live-gallery-sync": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python3 ./scripts/hook.py",
+        "timeout": 5
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "write_file|edit_file|write_to_file|replace_file_content|multi_replace_file_content|run_command|invoke_subagent|generate_image|image-generator|mcp_.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./scripts/hook.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

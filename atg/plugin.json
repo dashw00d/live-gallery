@@ -1,0 +1,12 @@
+{
+  "name": "live-gallery",
+  "displayName": "Live Gallery",
+  "version": "0.1.0",
+  "logo": "assets/logo.svg",
+  "description": "Real-time multimodal stream of 3D models, images, videos, audio, text, and code created by your agents inside the Antigravity 2.0 side panel.",
+  "suggestedPrompts": [
+    "Open the Live Gallery side panel to watch outputs as they're created",
+    "Show me the latest 3D models, images, and code generated in this workspace",
+    "Watch an extra output folder in Live Gallery"
+  ]
+}
